@@ -40,3 +40,13 @@ class NoNoop(RaftNode):
     def _append_noop(self):
         pass
 
+
+
+class CommitOldTerm(RaftNode):
+    def _can_commit(self, index):
+        replicas = 1 + sum(1 for match in self.match_index.values() if match >= index)
+        return self._has_majority(replicas)
+
+
+class CommitOldTermNoNoop(CommitOldTerm, NoNoop):
+    pass

@@ -206,9 +206,61 @@ def expect_live(sim, request_id):
     )
 
 
+def call_for(name, seed, node_cls):
+    if node_cls is RaftNode:
+        return f"{name}({seed})"
+    return f"{name}({seed}, {node_cls.__qualname__})"
+
+
+def wait_leader(sim, among, ticks=3000):
+    deadline = sim.now + ticks
+    while sim.now < deadline and sim.step():
+        found = leaders(sim, among)
+        if found:
+            return max(found, key=lambda i: term(sim, i))
+    raise ScenarioFailed(f"no leader among {sorted(among)}", sim)
+
+
+def figure8(seed, node_cls=RaftNode):
+    with repro(call_for("figure8", seed, node_cls), node_cls):
+        sim = Simulator(seed=seed, node_cls=node_cls)
+        a = wait_leader(sim, set(sim.nodes))
+        sim.run_until(sim.now + 200)
+        b = next(i for i in sim.nodes if i != a)
+        sim.partition([a, b])
+        sim.submit(a, ClientCommand(0, ("PUT", "x", "old")))
+        sim.run_until(sim.now + 100)
+
+        sim.crash(a)
+        rest = [i for i in sim.nodes if i != b]
+        sim.partition([b], [a])
+        c = wait_leader(sim, rest)
+        sim.partition([c], [b], [a])
+        sim.submit(c, ClientCommand(1, ("PUT", "x", "new")))
+        sim.run_until(sim.now + 100)
+
+        sim.crash(c)
+        sim.restart(a)
+        d, e = [i for i in rest if i != c]
+        sim.partition([a, b, d], [c])
+        old_leader = wait_leader(sim, [a, b, d])
+        expect(old_leader in (a, b), f"n{d} without x won the election", sim)
+        sim.run_until(sim.now + 300)
+
+        sim.crash(old_leader)
+        sim.restart(c)
+        sim.partition([c, d, e], [old_leader])
+        wait_leader(sim, [c, d, e])
+        sim.run_until(sim.now + 300)
+
+        sim.heal()
+        sim.restart(old_leader)
+        expect_live(sim, 2)
+        return sim
+
+
 def fuzz(seed, node_cls=RaftNode, ticks=FUZZ_TICKS):
-    call = f"fuzz({seed})" if node_cls is RaftNode else f"fuzz({seed}, {node_cls.__qualname__})"
-    with repro(call, node_cls):
+    with repro(call_for("fuzz", seed, node_cls), node_cls):
         sim = Simulator(seed=seed, config=FUZZ_CONFIG, node_cls=node_cls)
         rng = sim.rng
         down = []
@@ -247,4 +299,5 @@ SCENARIOS = {
     "split_vote": split_vote,
     "stale_leader_steps_down": stale_leader_steps_down,
     "liveness": liveness,
+    "figure8": figure8,
 }

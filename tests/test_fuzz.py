@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from raftlite.checker import InvariantViolation
-from raftlite.scenarios import ScenarioFailed, fuzz
+from raftlite.scenarios import ScenarioFailed, figure8, fuzz
 from tests import mutants
 
 FUZZ_SEEDS = int(os.environ.get("FUZZ_SEEDS", "100"))
@@ -69,3 +69,18 @@ def test_failure_prints_a_repro_command_that_reproduces_it():
     )
     assert result.returncode != 0
     assert "election safety" in result.stderr and "seed=0" in result.stderr
+
+
+def test_figure8_catches_old_term_commit_once_noop_is_gone():
+    for seed in range(20):
+        with pytest.raises(InvariantViolation) as caught:
+            figure8(seed, mutants.CommitOldTermNoNoop)
+        assert caught.value.invariant == "leader completeness", seed
+        assert "committed at index" in str(caught.value), seed
+        assert "figure8(" in str(caught.value), seed
+
+
+def test_old_term_commit_alone_is_harmless_while_leaders_append_a_noop():
+    for seed in range(20):
+        figure8(seed, mutants.CommitOldTerm)
+        figure8(seed, mutants.NoNoop)
