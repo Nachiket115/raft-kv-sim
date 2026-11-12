@@ -2,6 +2,7 @@ import heapq
 import random
 from dataclasses import dataclass
 
+from raftlite.checker import Checker
 from raftlite.messages import ClientReply, Send, SetTimer, TimerKind
 from raftlite.node import PersistentState, RaftNode
 
@@ -16,10 +17,11 @@ class SimConfig:
 
 
 class Simulator:
-    def __init__(self, node_count=5, seed=0, config=None, node_cls=RaftNode):
+    def __init__(self, node_count=5, seed=0, config=None, node_cls=RaftNode, checker=None):
         self.seed = seed
         self.config = config or SimConfig()
         self.rng = random.Random(seed)
+        self.checker = checker or Checker()
         self.now = 0
         self.trace = []
         self.client_replies = []
@@ -32,6 +34,7 @@ class Simulator:
         self.nodes = {i: node_cls(i, node_ids, self.persistent[i]) for i in node_ids}
         for node_id in node_ids:
             self._apply(node_id, self.nodes[node_id].start())
+        self._after_step()
 
     def step(self):
         if not self._queue:
@@ -47,6 +50,7 @@ class Simulator:
             case ("deliver", src, dst, msg):
                 self._log(f"n{src} -> n{dst} deliver {msg}")
                 self._apply(dst, self.nodes[dst].handle_message(msg))
+        self._after_step()
         return True
 
     def run_until(self, time):
@@ -60,6 +64,7 @@ class Simulator:
             if key[0] == node_id:
                 self._timer_generation[key] += 1
         self._log(f"n{node_id} crash")
+        self._after_step()
 
     def restart(self, node_id):
         if node_id in self.nodes:
@@ -68,10 +73,15 @@ class Simulator:
         self.nodes = dict(sorted({**self.nodes, node_id: node}.items()))
         self._log(f"n{node_id} restart")
         self._apply(node_id, node.start())
+        self._after_step()
 
     def submit(self, node_id, cmd):
         self._log(f"client -> n{node_id} {cmd}")
         self._apply(node_id, self.nodes[node_id].handle_client_command(cmd))
+        self._after_step()
+
+    def _after_step(self):
+        self.checker.check(self)
 
     def trace_text(self):
         return "".join(line + "\n" for line in self.trace)
