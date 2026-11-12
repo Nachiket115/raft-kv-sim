@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 
 from raftlite.scenarios import SCENARIOS, ScenarioFailed, run
@@ -32,4 +33,10 @@ def main(argv=None, out=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+        sys.stdout.flush()
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        code = 0
+    sys.exit(code)
