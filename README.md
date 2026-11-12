@@ -9,6 +9,9 @@ Python 3.11+, standard library only. Tests use pytest.
 
 ## Quick start
 
+Commands are shown for a POSIX shell (bash, zsh) and have not been tried on
+Windows.
+
 ```bash
 pip install -e '.[dev]'
 ```
