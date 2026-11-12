@@ -208,7 +208,10 @@ class RaftNode:
             self.next_index[peer] = self.match_index[peer] + 1
             self._advance_commit_index()
             return []
-        self.next_index[peer] = max(self.match_index[peer] + 1, self.next_index[peer] - 1)
+        next_index = max(self.match_index[peer] + 1, self.next_index[peer] - 1)
+        if next_index == self.next_index[peer]:
+            return []
+        self.next_index[peer] = next_index
         return [Send(peer, self._append_entries_for(peer))]
 
     def _can_commit(self, index):

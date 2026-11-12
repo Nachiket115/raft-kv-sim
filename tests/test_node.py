@@ -627,3 +627,12 @@ def test_restarted_node_applies_again_from_the_first_entry():
     assert node.applied == []
     node.handle_message(AppendEntries(1, 2, 2, 1, (), 2))
     assert node.applied == applied_from(log)
+
+
+def test_failure_response_that_cannot_move_next_index_sends_nothing():
+    node = leader_with_two_entries()
+    ack(node, 3, 2)
+    assert node.handle_message(AppendEntriesResponse(1, 3, False, 0)) == []
+    assert (node.match_index[3], node.next_index[3]) == (2, 3)
+    assert node.handle_message(AppendEntriesResponse(1, 1, False, 0)) == []
+    assert (node.match_index[1], node.next_index[1]) == (0, 1)
