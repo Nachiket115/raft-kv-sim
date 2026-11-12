@@ -147,3 +147,73 @@ def test_election_runs_with_same_seed_are_byte_identical():
     first = run(12).trace_text().encode()
     second = run(12).trace_text().encode()
     assert first == second
+
+
+def elected(seed):
+    sim = Simulator(seed=seed)
+    sim.run_until(3000)
+    (leader,) = leaders(sim)
+    return sim, leader
+
+
+def test_cluster_elects_new_leader_after_leader_is_killed():
+    for seed in range(50):
+        sim, old = elected(seed)
+        old_term = sim.nodes[old].persistent.current_term
+        sim.crash(old)
+        by_term = run_recording_leaders(sim, 6000)
+        assert all(len(ids) == 1 for ids in by_term.values()), (seed, by_term)
+        (new,) = leaders(sim)
+        assert new != old, seed
+        assert sim.nodes[new].persistent.current_term > old_term, seed
+        assert old not in sim.nodes
+
+
+def test_restarted_leader_rejoins_as_follower_with_persistent_state():
+    sim, old = elected(21)
+    persistent = sim.nodes[old].persistent
+    sim.crash(old)
+    assert persistent.voted_for == old
+    sim.run_until(6000)
+    (new,) = leaders(sim)
+    sim.restart(old)
+    assert sim.nodes[old].persistent is persistent
+    assert sim.nodes[old].role is Role.FOLLOWER
+    assert list(sim.nodes) == sorted(sim.nodes)
+    sim.run_until(9000)
+    assert leaders(sim) == [new]
+    assert sim.nodes[old].leader_id == new
+    assert persistent.current_term == sim.nodes[new].persistent.current_term
+
+
+def test_crashed_node_receives_nothing_and_its_timers_never_fire():
+    sim, old = elected(22)
+    sim.crash(old)
+    start = len(sim.trace)
+    sim.run_until(6000)
+    after = sim.trace[start:]
+    assert not any(f"n{old} election timeout" in line for line in after)
+    assert not any(f"n{old} heartbeat timeout" in line for line in after)
+    assert not any(f"-> n{old} deliver" in line for line in after)
+    assert any(f"-> n{old} dropped" in line for line in after)
+
+
+def test_timer_set_before_crash_does_not_fire_after_restart():
+    sim, old = elected(23)
+    sim.crash(old)
+    sim.restart(old)
+    start = len(sim.trace)
+    sim.run_until(sim.now + SimConfig().heartbeat_interval + 1)
+    assert not any(f"n{old} heartbeat timeout" in line for line in sim.trace[start:])
+
+
+def test_crash_and_restart_runs_are_byte_identical():
+    def scripted():
+        sim, old = elected(24)
+        sim.crash(old)
+        sim.run_until(6000)
+        sim.restart(old)
+        sim.run_until(9000)
+        return sim.trace_text().encode()
+
+    assert scripted() == scripted()

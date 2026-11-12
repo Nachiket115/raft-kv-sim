@@ -3,7 +3,7 @@ import random
 from dataclasses import dataclass
 
 from raftlite.messages import ClientReply, Send, SetTimer, TimerKind
-from raftlite.node import RaftNode
+from raftlite.node import PersistentState, RaftNode
 
 
 @dataclass(frozen=True)
@@ -26,8 +26,10 @@ class Simulator:
         self._queue = []
         self._seq = 0
         self._timer_generation = {}
-        node_ids = range(node_count)
-        self.nodes = {i: node_cls(i, node_ids) for i in node_ids}
+        self._node_cls = node_cls
+        self._node_ids = node_ids = range(node_count)
+        self.persistent = {i: PersistentState() for i in node_ids}
+        self.nodes = {i: node_cls(i, node_ids, self.persistent[i]) for i in node_ids}
         for node_id in node_ids:
             self._apply(node_id, self.nodes[node_id].start())
 
@@ -40,6 +42,8 @@ class Simulator:
                 if self._timer_generation[node_id, kind] == generation:
                     self._log(f"n{node_id} {kind.value} timeout")
                     self._apply(node_id, self.nodes[node_id].handle_timeout(kind))
+            case ("deliver", src, dst, msg) if dst not in self.nodes:
+                self._log(f"n{src} -> n{dst} dropped {msg}")
             case ("deliver", src, dst, msg):
                 self._log(f"n{src} -> n{dst} deliver {msg}")
                 self._apply(dst, self.nodes[dst].handle_message(msg))
@@ -49,6 +53,21 @@ class Simulator:
         while self._queue and self._queue[0][0] <= time:
             self.step()
         self.now = max(self.now, time)
+
+    def crash(self, node_id):
+        del self.nodes[node_id]
+        for key in self._timer_generation:
+            if key[0] == node_id:
+                self._timer_generation[key] += 1
+        self._log(f"n{node_id} crash")
+
+    def restart(self, node_id):
+        if node_id in self.nodes:
+            raise ValueError(f"n{node_id} is already running")
+        node = self._node_cls(node_id, self._node_ids, self.persistent[node_id])
+        self.nodes = dict(sorted({**self.nodes, node_id: node}.items()))
+        self._log(f"n{node_id} restart")
+        self._apply(node_id, node.start())
 
     def submit(self, node_id, cmd):
         self._log(f"client -> n{node_id} {cmd}")
