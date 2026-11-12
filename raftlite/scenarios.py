@@ -1,11 +1,15 @@
+from contextlib import contextmanager
 from dataclasses import replace
 
 from raftlite.checker import TRACE_TAIL
 from raftlite.messages import ClientCommand
-from raftlite.node import Role
+from raftlite.node import RaftNode, Role
 from raftlite.sim import SimConfig, Simulator
 
 LIVENESS_BOUND = 10 * SimConfig().election_timeout_max
+FUZZ_CONFIG = SimConfig(drop_prob=0.05, duplicate_prob=0.05, delay_prob=0.05)
+FUZZ_TICKS = 6000
+MAX_DOWN = 2
 
 
 class ScenarioFailed(AssertionError):
@@ -19,6 +23,27 @@ class ScenarioFailed(AssertionError):
 def expect(condition, detail, sim):
     if not condition:
         raise ScenarioFailed(detail, sim)
+
+
+def repro_command(call, node_cls=RaftNode):
+    imports = "from raftlite.scenarios import *"
+    if node_cls is not RaftNode:
+        imports += f"; from {node_cls.__module__} import {node_cls.__qualname__}"
+    return f'python -c "{imports}; {call}"'
+
+
+@contextmanager
+def repro(call, node_cls=RaftNode):
+    try:
+        yield
+    except AssertionError as error:
+        error.args = (f"{error}\nrepro: {repro_command(call, node_cls)}",)
+        raise
+
+
+def run(name, seed):
+    with repro(f"run({name!r}, {seed})"):
+        return SCENARIOS[name](seed)
 
 
 def leaders(sim, among=None):
@@ -164,9 +189,14 @@ def liveness(seed):
     sim.run_until(3000)
     sim.heal()
     sim.restart(4)
-    sim.config = replace(config, drop_prob=0.0, duplicate_prob=0.0, delay_prob=0.0)
+    expect_live(sim, 0)
+    return sim
+
+
+def expect_live(sim, request_id):
+    sim.config = replace(sim.config, drop_prob=0.0, duplicate_prob=0.0, delay_prob=0.0)
     deadline = sim.now + LIVENESS_BOUND
-    request(sim, 0, ("PUT", "live", 1), deadline=deadline)
+    request(sim, request_id, ("PUT", "live", 1), deadline=deadline)
     while sim.now < deadline and not all("live" in n.kv.data for n in sim.nodes.values()):
         sim.run_until(sim.now + 50)
     expect(
@@ -174,7 +204,40 @@ def liveness(seed):
         f"command not applied everywhere within {LIVENESS_BOUND} ticks",
         sim,
     )
-    return sim
+
+
+def fuzz(seed, node_cls=RaftNode, ticks=FUZZ_TICKS):
+    call = f"fuzz({seed})" if node_cls is RaftNode else f"fuzz({seed}, {node_cls.__qualname__})"
+    with repro(call, node_cls):
+        sim = Simulator(seed=seed, config=FUZZ_CONFIG, node_cls=node_cls)
+        rng = sim.rng
+        down = []
+        request_id = 0
+        while sim.now < ticks:
+            sim.run_until(sim.now + rng.randint(20, 300))
+            action = rng.choice(["partition", "heal", "crash", "restart", "submit", "submit"])
+            if action == "partition":
+                ids = sorted(sim.persistent)
+                rng.shuffle(ids)
+                cut = rng.randint(1, len(ids) - 1)
+                sim.partition(ids[:cut], ids[cut:])
+            elif action == "heal":
+                sim.heal()
+            elif action == "crash" and len(down) < MAX_DOWN:
+                node_id = rng.choice(sorted(sim.nodes))
+                sim.crash(node_id)
+                down.append(node_id)
+            elif action == "restart" and down:
+                sim.restart(down.pop(rng.randrange(len(down))))
+            elif action == "submit" and leaders(sim):
+                newest = max(leaders(sim), key=lambda i: term(sim, i))
+                sim.submit(newest, ClientCommand(request_id, ("PUT", f"k{request_id}", request_id)))
+                request_id += 1
+        sim.heal()
+        for node_id in sorted(down):
+            sim.restart(node_id)
+        expect_live(sim, request_id)
+        return sim
 
 
 SCENARIOS = {

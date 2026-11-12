@@ -1,18 +1,18 @@
 import pytest
 
-from raftlite.scenarios import SCENARIOS, ScenarioFailed, expect, leaders
+from raftlite.scenarios import SCENARIOS, ScenarioFailed, expect, leaders, run
 from raftlite.sim import Simulator
 
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
 def test_scenario_passes_on_every_seed(name):
     for seed in range(50):
-        SCENARIOS[name](seed)
+        run(name, seed)
 
 
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
 def test_scenario_traces_are_byte_identical_for_a_seed(name):
-    assert SCENARIOS[name](7).trace_text() == SCENARIOS[name](7).trace_text()
+    assert run(name, 7).trace_text() == run(name, 7).trace_text()
 
 
 def test_scenario_failure_reports_seed_and_trace_tail():
