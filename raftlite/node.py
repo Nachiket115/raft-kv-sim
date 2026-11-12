@@ -169,6 +169,8 @@ class RaftNode:
         term = self.persistent.current_term
         if msg.term < term:
             return [Send(msg.leader_id, AppendEntriesResponse(term, self.node_id, False, 0))]
+        if self.role is Role.LEADER:
+            return []
         self.role = Role.FOLLOWER
         self.leader_id = msg.leader_id
         success = self._log_matches(msg.prev_log_index, msg.prev_log_term)

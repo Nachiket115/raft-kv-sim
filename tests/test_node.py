@@ -562,3 +562,14 @@ def test_follower_commit_index_never_goes_backwards():
     node.handle_message(AppendEntries(1, 2, 0, 0, (), 0))
     node.handle_message(AppendEntries(1, 2, 3, 1, (), 2))
     assert (node.commit_index, node.last_applied) == (3, 3)
+
+
+def test_leader_ignores_append_entries_from_its_own_term():
+    node = leader_with_two_entries()
+    log = list(node.persistent.log)
+    other = (LogEntry(1, ("OTHER",)),)
+    assert node.handle_message(AppendEntries(1, 2, 0, 0, other, 1)) == []
+    assert node.role is Role.LEADER
+    assert node.leader_id == 0
+    assert node.persistent.log == log
+    assert node.commit_index == 0
