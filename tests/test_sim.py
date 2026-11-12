@@ -217,3 +217,33 @@ def test_crash_and_restart_runs_are_byte_identical():
         return sim.trace_text().encode()
 
     assert scripted() == scripted()
+
+
+def test_commands_sent_to_leader_reach_every_log_in_order():
+    for seed in range(20):
+        sim, leader = elected(seed)
+        commands = [("PUT", f"k{i}", i) for i in range(5)]
+        for i, command in enumerate(commands):
+            sim.submit(leader, ClientCommand(i, command))
+            sim.run_until(sim.now + 7)
+        sim.run_until(sim.now + 500)
+        assert leaders(sim) == [leader], seed
+        for node_id, persistent in sim.persistent.items():
+            assert [e.command for e in persistent.log] == commands, (seed, node_id)
+
+
+def test_restarted_follower_catches_up_on_missed_entries():
+    sim, leader = elected(31)
+    follower = next(i for i in sim.nodes if i != leader)
+    sim.submit(leader, ClientCommand(1, ("PUT", "a", 1)))
+    sim.run_until(sim.now + 100)
+    sim.crash(follower)
+    sim.submit(leader, ClientCommand(2, ("PUT", "b", 2)))
+    sim.submit(leader, ClientCommand(3, ("DELETE", "a")))
+    sim.run_until(sim.now + 100)
+    assert len(sim.persistent[follower].log) == 1
+    sim.restart(follower)
+    sim.run_until(sim.now + 500)
+    assert leaders(sim) == [leader]
+    assert sim.persistent[follower].log == sim.persistent[leader].log
+    assert len(sim.persistent[leader].log) == 3

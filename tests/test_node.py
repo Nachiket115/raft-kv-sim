@@ -309,3 +309,162 @@ def test_single_node_cluster_elects_itself():
     node = RaftNode(0, [0])
     assert node.handle_timeout(TimerKind.ELECTION) == [HEARTBEAT]
     assert node.role is Role.LEADER
+
+
+def entries(*terms):
+    return [LogEntry(term, ("PUT", f"k{i}", i)) for i, term in enumerate(terms, 1)]
+
+
+def make_follower(*terms, term=None):
+    log = entries(*terms)
+    return make_node(0, PersistentState(term or max(terms, default=1), None, log))
+
+
+def test_leader_appends_command_and_sends_it_to_every_peer():
+    node = make_leader()
+    effects = node.handle_client_command(ClientCommand(7, ("PUT", "a", 1)))
+    entry = LogEntry(1, ("PUT", "a", 1))
+    assert node.persistent.log == [entry]
+    assert effects == [Send(peer, AppendEntries(1, 0, 0, 0, (entry,), 0)) for peer in node.peers]
+
+
+def test_new_leader_starts_after_its_existing_log():
+    node = make_leader(0, PersistentState(2, None, entries(1, 2)))
+    node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    sent = node.handle_timeout(TimerKind.HEARTBEAT)[0].msg
+    assert (sent.prev_log_index, sent.prev_log_term) == (2, 2)
+    assert sent.entries == (LogEntry(3, ("PUT", "a", 1)),)
+
+
+def test_heartbeat_resends_entries_that_are_not_acknowledged():
+    node = make_leader()
+    node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    node.handle_client_command(ClientCommand(2, ("PUT", "b", 2)))
+    node.handle_message(AppendEntriesResponse(1, 1, True, 1))
+    effects = node.handle_timeout(TimerKind.HEARTBEAT)
+    log = node.persistent.log
+    assert effects[0] == Send(1, AppendEntries(1, 0, 1, 1, (log[1],), 0))
+    assert effects[1] == Send(2, AppendEntries(1, 0, 0, 0, tuple(log), 0))
+
+
+def test_follower_appends_entries_and_reports_match_index():
+    node = make_follower(1)
+    new = tuple(entries(1, 1, 1)[1:])
+    effects = node.handle_message(AppendEntries(1, 2, 1, 1, new, 0))
+    assert node.persistent.log == entries(1, 1, 1)
+    assert effects == [ELECTION, Send(2, AppendEntriesResponse(1, 0, True, 3))]
+
+
+def test_follower_rejects_when_previous_entry_is_missing():
+    node = make_follower(1)
+    effects = node.handle_message(AppendEntries(1, 2, 2, 1, (LogEntry(1, ("X",)),), 0))
+    assert effects == [ELECTION, Send(2, AppendEntriesResponse(1, 0, False, 0))]
+    assert node.persistent.log == entries(1)
+    assert node.leader_id == 2
+
+
+def test_follower_rejects_when_previous_term_differs():
+    node = make_follower(1, 1, term=3)
+    effects = node.handle_message(AppendEntries(3, 2, 2, 2, (LogEntry(3, ("X",)),), 0))
+    assert effects == [ELECTION, Send(2, AppendEntriesResponse(3, 0, False, 0))]
+    assert node.persistent.log == entries(1, 1)
+
+
+def test_candidate_steps_down_even_when_consistency_check_fails():
+    node = make_node(0)
+    node.handle_timeout(TimerKind.ELECTION)
+    node.handle_message(AppendEntries(1, 2, 3, 1, (), 0))
+    assert node.role is Role.FOLLOWER
+    assert node.leader_id == 2
+
+
+def test_follower_replaces_conflicting_suffix():
+    node = make_follower(1, 2, 2, term=3)
+    new = (LogEntry(3, ("NEW", 2)), LogEntry(3, ("NEW", 3)))
+    effects = node.handle_message(AppendEntries(3, 2, 1, 1, new, 0))
+    assert node.persistent.log == entries(1) + list(new)
+    assert effects[-1] == Send(2, AppendEntriesResponse(3, 0, True, 3))
+
+
+def test_conflict_truncates_everything_after_it():
+    node = make_follower(1, 2, 2, term=3)
+    new = (LogEntry(3, ("NEW", 2)),)
+    node.handle_message(AppendEntries(3, 2, 1, 1, new, 0))
+    assert node.persistent.log == entries(1) + list(new)
+
+
+def test_late_shorter_append_entries_does_not_truncate():
+    node = make_follower(1, 1, 1)
+    old = tuple(entries(1, 1)[1:])
+    effects = node.handle_message(AppendEntries(1, 2, 1, 1, old, 0))
+    assert node.persistent.log == entries(1, 1, 1)
+    assert effects[-1] == Send(2, AppendEntriesResponse(1, 0, True, 2))
+
+
+def test_late_heartbeat_does_not_truncate():
+    node = make_follower(1, 1, 1)
+    effects = node.handle_message(AppendEntries(1, 2, 0, 0, (), 0))
+    assert node.persistent.log == entries(1, 1, 1)
+    assert effects[-1] == Send(2, AppendEntriesResponse(1, 0, True, 0))
+
+
+def test_duplicate_append_entries_changes_nothing():
+    node = make_follower()
+    msg = AppendEntries(1, 2, 0, 0, tuple(entries(1, 1)), 0)
+    first = node.handle_message(msg)
+    assert node.handle_message(msg) == first
+    assert node.persistent.log == entries(1, 1)
+
+
+def leader_with_two_entries():
+    node = make_leader()
+    node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    node.handle_client_command(ClientCommand(2, ("PUT", "b", 2)))
+    return node
+
+
+def test_success_response_advances_match_and_next_index():
+    node = leader_with_two_entries()
+    assert node.handle_message(AppendEntriesResponse(1, 3, True, 2)) == []
+    assert (node.match_index[3], node.next_index[3]) == (2, 3)
+    assert (node.match_index[1], node.next_index[1]) == (0, 1)
+
+
+def test_stale_success_response_does_not_move_match_index_back():
+    node = leader_with_two_entries()
+    node.handle_message(AppendEntriesResponse(1, 3, True, 2))
+    node.handle_message(AppendEntriesResponse(1, 3, True, 1))
+    node.handle_message(AppendEntriesResponse(1, 3, True, 0))
+    assert (node.match_index[3], node.next_index[3]) == (2, 3)
+
+
+def test_failure_response_backs_up_and_retries_at_once():
+    node = make_leader(0, PersistentState(2, None, entries(1, 2)))
+    log = node.persistent.log
+    effects = node.handle_message(AppendEntriesResponse(3, 1, False, 0))
+    assert node.next_index[1] == 2
+    assert effects == [Send(1, AppendEntries(3, 0, 1, 1, (log[1],), 0))]
+    effects = node.handle_message(AppendEntriesResponse(3, 1, False, 0))
+    assert node.next_index[1] == 1
+    assert effects == [Send(1, AppendEntries(3, 0, 0, 0, tuple(log), 0))]
+
+
+def test_stale_failure_response_never_drops_next_index_to_match_index():
+    node = leader_with_two_entries()
+    node.handle_message(AppendEntriesResponse(1, 3, True, 2))
+    node.handle_message(AppendEntriesResponse(1, 3, False, 0))
+    node.handle_message(AppendEntriesResponse(1, 3, False, 0))
+    assert (node.match_index[3], node.next_index[3]) == (2, 3)
+
+
+def test_append_response_from_another_term_is_ignored():
+    node = make_leader(0, PersistentState(2, None, entries(1, 2)))
+    assert node.handle_message(AppendEntriesResponse(2, 1, True, 2)) == []
+    assert node.handle_message(AppendEntriesResponse(2, 1, False, 0)) == []
+    assert (node.match_index[1], node.next_index[1]) == (0, 3)
+
+
+def test_append_response_is_ignored_when_not_leader():
+    node = make_follower(1)
+    assert node.handle_message(AppendEntriesResponse(1, 1, False, 0)) == []
+    assert node.handle_message(AppendEntriesResponse(1, 1, True, 1)) == []

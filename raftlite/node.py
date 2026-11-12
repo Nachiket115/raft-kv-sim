@@ -65,7 +65,7 @@ class RaftNode:
             case AppendEntries():
                 effects = self._on_append_entries(msg)
             case AppendEntriesResponse():
-                effects = []
+                effects = self._on_append_entries_response(msg)
             case _:
                 raise TypeError(f"unknown message: {msg!r}")
         election_timer = SetTimer(TimerKind.ELECTION)
@@ -76,7 +76,8 @@ class RaftNode:
     def handle_client_command(self, cmd: ClientCommand) -> list[Effect]:
         if self.role is not Role.LEADER:
             return [ClientReply(cmd.request_id, ok=False, leader_hint=self.leader_id)]
-        raise NotImplementedError("leader command handling is not implemented yet")
+        self.persistent.log.append(LogEntry(self.persistent.current_term, cmd.command))
+        return self._broadcast_append_entries()
 
     def _last_log_index(self):
         return len(self.persistent.log)
@@ -137,7 +138,7 @@ class RaftNode:
             self.node_id,
             prev_index,
             prev_term,
-            (),
+            tuple(self.persistent.log[prev_index:]),
             self.commit_index,
         )
 
@@ -169,7 +170,37 @@ class RaftNode:
             return [Send(msg.leader_id, AppendEntriesResponse(term, self.node_id, False, 0))]
         self.role = Role.FOLLOWER
         self.leader_id = msg.leader_id
+        success = self._log_matches(msg.prev_log_index, msg.prev_log_term)
+        match_index = 0
+        if success:
+            self._store_entries(msg.prev_log_index, msg.entries)
+            match_index = msg.prev_log_index + len(msg.entries)
         return [
             SetTimer(TimerKind.ELECTION),
-            Send(msg.leader_id, AppendEntriesResponse(term, self.node_id, True, 0)),
+            Send(msg.leader_id, AppendEntriesResponse(term, self.node_id, success, match_index)),
         ]
+
+    def _log_matches(self, prev_log_index, prev_log_term):
+        if prev_log_index == 0:
+            return True
+        log = self.persistent.log
+        return prev_log_index <= len(log) and log[prev_log_index - 1].term == prev_log_term
+
+    def _store_entries(self, prev_log_index, entries):
+        log = self.persistent.log
+        for index, entry in enumerate(entries, prev_log_index + 1):
+            if index <= len(log) and log[index - 1].term != entry.term:
+                del log[index - 1 :]
+            if index > len(log):
+                log.append(entry)
+
+    def _on_append_entries_response(self, msg):
+        if self.role is not Role.LEADER or msg.term != self.persistent.current_term:
+            return []
+        peer = msg.follower_id
+        if msg.success:
+            self.match_index[peer] = max(self.match_index[peer], msg.match_index)
+            self.next_index[peer] = self.match_index[peer] + 1
+            return []
+        self.next_index[peer] = max(self.match_index[peer] + 1, self.next_index[peer] - 1)
+        return [Send(peer, self._append_entries_for(peer))]
