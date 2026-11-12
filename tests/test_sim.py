@@ -291,3 +291,33 @@ def test_every_node_applies_the_whole_log_in_order_including_after_restart():
     assert len(expected) == 4
     for node_id, node in sim.nodes.items():
         assert node.applied == expected, node_id
+
+
+def test_scripted_workload_gives_identical_kv_state_on_all_live_nodes():
+    for seed in range(20):
+        sim, leader = elected(seed)
+        workload = [
+            ("PUT", "a", 1),
+            ("PUT", "b", 2),
+            ("GET", "a"),
+            ("DELETE", "a"),
+            ("PUT", "c", 3),
+            ("GET", "a"),
+        ]
+        for i, command in enumerate(workload):
+            sim.submit(leader, ClientCommand(i, command))
+            sim.run_until(sim.now + 7)
+        sim.run_until(sim.now + 500)
+        for node_id, node in sim.nodes.items():
+            assert node.kv.data == {"b": 2, "c": 3}, (seed, node_id)
+        replies = {r.request_id: r for n, r in sim.client_replies if n == leader}
+        assert [replies[i].result for i in range(6)] == [None, None, 1, True, None, None], seed
+        assert all(r.ok for r in replies.values()), seed
+
+
+def test_non_leader_in_running_cluster_rejects_with_leader_hint():
+    sim, leader = elected(5)
+    follower = next(i for i in sim.nodes if i != leader)
+    sim.run_until(sim.now + 200)
+    sim.submit(follower, ClientCommand(9, ("PUT", "a", 1)))
+    assert sim.client_replies[-1] == (follower, ClientReply(9, ok=False, leader_hint=leader))

@@ -527,7 +527,9 @@ def test_leader_sends_its_commit_index():
 def test_single_node_cluster_commits_at_once():
     node = RaftNode(0, [0])
     node.handle_timeout(TimerKind.ELECTION)
-    assert node.handle_client_command(ClientCommand(1, ("PUT", "a", 1))) == []
+    assert node.handle_client_command(ClientCommand(1, ("PUT", "a", 1))) == [
+        ClientReply(1, ok=True)
+    ]
     assert (node.commit_index, node.last_applied) == (1, 1)
 
 
@@ -636,3 +638,47 @@ def test_failure_response_that_cannot_move_next_index_sends_nothing():
     assert (node.match_index[3], node.next_index[3]) == (2, 3)
     assert node.handle_message(AppendEntriesResponse(1, 1, False, 0)) == []
     assert (node.match_index[1], node.next_index[1]) == (0, 1)
+
+
+def test_leader_replies_with_result_once_entry_commits():
+    node = make_leader()
+    assert not any(
+        isinstance(e, ClientReply)
+        for e in node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    )
+    node.handle_client_command(ClientCommand(2, ("GET", "a")))
+    assert ack(node, 1, 2) == []
+    assert ack(node, 2, 2) == [ClientReply(1, ok=True), ClientReply(2, ok=True, result=1)]
+    assert node.kv.data == {"a": 1}
+
+
+def test_follower_applies_to_kv_without_replying():
+    node = make_follower()
+    log = [LogEntry(1, ("PUT", "a", 1)), LogEntry(1, ("DELETE", "a"))]
+    effects = node.handle_message(AppendEntries(1, 2, 0, 0, tuple(log), 2))
+    assert not any(isinstance(e, ClientReply) for e in effects)
+    assert node.kv.data == {}
+
+
+def test_leader_that_steps_down_sends_no_reply_for_pending_request():
+    node = make_leader()
+    node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    node.handle_message(AppendEntries(2, 3, 0, 0, (), 0))
+    assert node.pending == {}
+    assert node.role is Role.FOLLOWER
+
+
+def test_invalid_command_is_applied_as_error_reply():
+    node = RaftNode(0, [0])
+    node.handle_timeout(TimerKind.ELECTION)
+    [reply] = node.handle_client_command(ClientCommand(1, ("INCR", "a")))
+    assert reply.request_id == 1 and not reply.ok and "INCR" in reply.result
+
+
+def test_restarted_node_rebuilds_kv_from_log():
+    log = [LogEntry(1, ("PUT", "a", 1)), LogEntry(1, ("PUT", "b", 2))]
+    persistent = PersistentState(1, None, list(log))
+    node = make_node(0, persistent)
+    assert node.kv.data == {}
+    node.handle_message(AppendEntries(1, 2, 2, 1, (), 2))
+    assert node.kv.data == {"a": 1, "b": 2}

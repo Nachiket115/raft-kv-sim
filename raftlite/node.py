@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 
+from raftlite.kv import KVStore
 from raftlite.messages import (
     AppendEntries,
     AppendEntriesResponse,
@@ -40,6 +41,9 @@ class RaftNode:
         self.commit_index = 0
         self.last_applied = 0
         self.applied = []
+        self.kv = KVStore()
+        self.pending = {}
+        self.replies = []
         self.next_index = {}
         self.match_index = {}
         self.votes = set()
@@ -69,6 +73,7 @@ class RaftNode:
                 effects = self._on_append_entries_response(msg)
             case _:
                 raise TypeError(f"unknown message: {msg!r}")
+        effects += self._take_replies()
         election_timer = SetTimer(TimerKind.ELECTION)
         if was_leader and self.role is not Role.LEADER and election_timer not in effects:
             effects.append(election_timer)
@@ -78,8 +83,9 @@ class RaftNode:
         if self.role is not Role.LEADER:
             return [ClientReply(cmd.request_id, ok=False, leader_hint=self.leader_id)]
         self.persistent.log.append(LogEntry(self.persistent.current_term, cmd.command))
+        self.pending[self._last_log_index()] = cmd.request_id
         self._advance_commit_index()
-        return self._broadcast_append_entries()
+        return self._broadcast_append_entries() + self._take_replies()
 
     def _last_log_index(self):
         return len(self.persistent.log)
@@ -105,6 +111,7 @@ class RaftNode:
         self.persistent.voted_for = None
         self.role = Role.FOLLOWER
         self.leader_id = None
+        self.pending.clear()
 
     def _start_election(self):
         self.persistent.current_term += 1
@@ -235,3 +242,14 @@ class RaftNode:
 
     def _apply(self, index, entry):
         self.applied.append((index, entry.command))
+        request_id = self.pending.pop(index, None)
+        try:
+            ok, result = True, self.kv.apply(entry.command)
+        except ValueError as error:
+            ok, result = False, str(error)
+        if request_id is not None:
+            self.replies.append(ClientReply(request_id, ok, result))
+
+    def _take_replies(self):
+        replies, self.replies = self.replies, []
+        return replies
