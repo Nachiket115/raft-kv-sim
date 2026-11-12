@@ -418,6 +418,8 @@ def test_isolated_leader_steps_down_after_heal():
         new = [i for i in leaders(sim) if i != old]
         assert len(new) == 1, seed
         assert sim.nodes[new[0]].persistent.current_term > old_term, seed
+        assert sim.nodes[old].role is Role.LEADER, seed
+        assert sim.nodes[old].persistent.current_term == old_term, seed
         commit_before = sim.nodes[old].commit_index
         sim.submit(old, ClientCommand(1, ("PUT", "x", 1)))
         sim.run_until(sim.now + 500)
