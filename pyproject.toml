@@ -1,0 +1,12 @@
+[project]
+name = "raftlite"
+version = "0.1.0"
+description = "Raft consensus core in a deterministic, fault-injecting simulator"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
