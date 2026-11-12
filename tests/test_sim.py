@@ -274,3 +274,20 @@ def test_restarted_follower_commits_and_applies_what_it_missed():
     node = sim.nodes[follower]
     assert (node.commit_index, node.last_applied) == (3, 3)
     assert node.persistent.log == sim.persistent[leader].log
+
+
+def test_every_node_applies_the_whole_log_in_order_including_after_restart():
+    sim, leader = elected(33)
+    follower = next(i for i in sim.nodes if i != leader)
+    sim.submit(leader, ClientCommand(0, ("PUT", "a", 0)))
+    sim.run_until(sim.now + 100)
+    sim.crash(follower)
+    for i in range(1, 4):
+        sim.submit(leader, ClientCommand(i, ("PUT", f"k{i}", i)))
+    sim.run_until(sim.now + 100)
+    sim.restart(follower)
+    sim.run_until(sim.now + 500)
+    expected = [(i, e.command) for i, e in enumerate(sim.persistent[leader].log, 1)]
+    assert len(expected) == 4
+    for node_id, node in sim.nodes.items():
+        assert node.applied == expected, node_id

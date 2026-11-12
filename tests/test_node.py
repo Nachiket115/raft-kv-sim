@@ -573,3 +573,57 @@ def test_leader_ignores_append_entries_from_its_own_term():
     assert node.leader_id == 0
     assert node.persistent.log == log
     assert node.commit_index == 0
+
+
+def applied_from(log):
+    return [(index, entry.command) for index, entry in enumerate(log, 1)]
+
+
+def test_new_node_has_applied_nothing():
+    assert make_node().applied == []
+
+
+def test_follower_applies_each_entry_in_order_when_commit_jumps():
+    node = make_follower()
+    log = entries(1, 1, 1)
+    node.handle_message(AppendEntries(1, 2, 0, 0, tuple(log), 3))
+    assert node.applied == applied_from(log)
+    assert (node.commit_index, node.last_applied) == (3, 3)
+
+
+def test_leader_applies_each_entry_in_order_when_commit_jumps():
+    node = make_leader()
+    for i in range(3):
+        node.handle_client_command(ClientCommand(i, ("PUT", f"k{i}", i)))
+    ack(node, 1, 3)
+    assert node.applied == []
+    ack(node, 2, 3)
+    assert node.applied == applied_from(node.persistent.log)
+
+
+def test_applying_continues_from_last_applied():
+    node = make_follower()
+    log = entries(1, 1, 1)
+    node.handle_message(AppendEntries(1, 2, 0, 0, tuple(log), 1))
+    assert node.applied == applied_from(log)[:1]
+    node.handle_message(AppendEntries(1, 2, 3, 1, (), 3))
+    assert node.applied == applied_from(log)
+
+
+def test_duplicate_append_entries_applies_nothing_twice():
+    node = make_follower()
+    log = entries(1, 1)
+    msg = AppendEntries(1, 2, 0, 0, tuple(log), 2)
+    node.handle_message(msg)
+    node.handle_message(msg)
+    assert node.applied == applied_from(log)
+
+
+def test_restarted_node_applies_again_from_the_first_entry():
+    log = entries(1, 1)
+    persistent = PersistentState(1, None, [])
+    make_node(0, persistent).handle_message(AppendEntries(1, 2, 0, 0, tuple(log), 2))
+    node = make_node(0, persistent)
+    assert node.applied == []
+    node.handle_message(AppendEntries(1, 2, 2, 1, (), 2))
+    assert node.applied == applied_from(log)

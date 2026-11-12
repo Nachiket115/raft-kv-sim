@@ -39,6 +39,7 @@ class RaftNode:
         self.leader_id = None
         self.commit_index = 0
         self.last_applied = 0
+        self.applied = []
         self.next_index = {}
         self.match_index = {}
         self.votes = set()
@@ -225,4 +226,9 @@ class RaftNode:
 
     def _set_commit_index(self, index):
         self.commit_index = max(self.commit_index, index)
-        self.last_applied = self.commit_index
+        while self.last_applied < self.commit_index:
+            self.last_applied += 1
+            self._apply(self.last_applied, self.persistent.log[self.last_applied - 1])
+
+    def _apply(self, index, entry):
+        self.applied.append((index, entry.command))
