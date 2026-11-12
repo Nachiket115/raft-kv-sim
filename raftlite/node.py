@@ -77,6 +77,7 @@ class RaftNode:
         if self.role is not Role.LEADER:
             return [ClientReply(cmd.request_id, ok=False, leader_hint=self.leader_id)]
         self.persistent.log.append(LogEntry(self.persistent.current_term, cmd.command))
+        self._advance_commit_index()
         return self._broadcast_append_entries()
 
     def _last_log_index(self):
@@ -175,6 +176,7 @@ class RaftNode:
         if success:
             self._store_entries(msg.prev_log_index, msg.entries)
             match_index = msg.prev_log_index + len(msg.entries)
+            self._set_commit_index(min(msg.leader_commit, match_index))
         return [
             SetTimer(TimerKind.ELECTION),
             Send(msg.leader_id, AppendEntriesResponse(term, self.node_id, success, match_index)),
@@ -201,6 +203,24 @@ class RaftNode:
         if msg.success:
             self.match_index[peer] = max(self.match_index[peer], msg.match_index)
             self.next_index[peer] = self.match_index[peer] + 1
+            self._advance_commit_index()
             return []
         self.next_index[peer] = max(self.match_index[peer] + 1, self.next_index[peer] - 1)
         return [Send(peer, self._append_entries_for(peer))]
+
+    def _can_commit(self, index):
+        replicas = 1 + sum(1 for match in self.match_index.values() if match >= index)
+        return (
+            self.persistent.log[index - 1].term == self.persistent.current_term
+            and self._has_majority(replicas)
+        )
+
+    def _advance_commit_index(self):
+        for index in range(self._last_log_index(), self.commit_index, -1):
+            if self._can_commit(index):
+                self._set_commit_index(index)
+                return
+
+    def _set_commit_index(self, index):
+        self.commit_index = max(self.commit_index, index)
+        self.last_applied = self.commit_index

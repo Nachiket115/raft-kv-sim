@@ -468,3 +468,97 @@ def test_append_response_is_ignored_when_not_leader():
     node = make_follower(1)
     assert node.handle_message(AppendEntriesResponse(1, 1, False, 0)) == []
     assert node.handle_message(AppendEntriesResponse(1, 1, True, 1)) == []
+
+
+def ack(node, peer, match_index):
+    term = node.persistent.current_term
+    return node.handle_message(AppendEntriesResponse(term, peer, True, match_index))
+
+
+def test_leader_commits_only_once_a_majority_has_the_entry():
+    node = leader_with_two_entries()
+    ack(node, 1, 1)
+    assert node.commit_index == 0
+    ack(node, 2, 1)
+    assert (node.commit_index, node.last_applied) == (1, 1)
+
+
+def test_leader_commits_highest_index_a_majority_has():
+    node = leader_with_two_entries()
+    ack(node, 1, 2)
+    ack(node, 2, 2)
+    assert (node.commit_index, node.last_applied) == (2, 2)
+
+
+def test_leader_commits_lower_index_when_higher_lacks_majority():
+    node = leader_with_two_entries()
+    ack(node, 1, 2)
+    ack(node, 2, 1)
+    assert node.commit_index == 1
+
+
+def test_duplicate_acks_from_one_peer_do_not_make_a_majority():
+    node = leader_with_two_entries()
+    ack(node, 1, 2)
+    ack(node, 1, 2)
+    assert node.commit_index == 0
+
+
+def test_old_term_entry_is_not_committed_by_counting_replicas():
+    node = make_leader(0, PersistentState(2, None, entries(1, 2)))
+    for peer in node.peers:
+        ack(node, peer, 2)
+    assert node.commit_index == 0
+    node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    ack(node, 1, 3)
+    assert node.commit_index == 0
+    ack(node, 2, 3)
+    assert (node.commit_index, node.last_applied) == (3, 3)
+
+
+def test_leader_sends_its_commit_index():
+    node = leader_with_two_entries()
+    ack(node, 1, 2)
+    ack(node, 2, 2)
+    sent = node.handle_timeout(TimerKind.HEARTBEAT)[0].msg
+    assert sent.leader_commit == 2
+
+
+def test_single_node_cluster_commits_at_once():
+    node = RaftNode(0, [0])
+    node.handle_timeout(TimerKind.ELECTION)
+    assert node.handle_client_command(ClientCommand(1, ("PUT", "a", 1))) == []
+    assert (node.commit_index, node.last_applied) == (1, 1)
+
+
+def test_follower_commit_follows_leader_commit():
+    node = make_follower()
+    node.handle_message(AppendEntries(1, 2, 0, 0, tuple(entries(1, 1, 1)), 2))
+    assert (node.commit_index, node.last_applied) == (2, 2)
+
+
+def test_follower_commit_stops_at_last_new_entry():
+    node = make_follower()
+    node.handle_message(AppendEntries(1, 2, 0, 0, tuple(entries(1, 1)), 5))
+    assert (node.commit_index, node.last_applied) == (2, 2)
+
+
+def test_follower_commit_uses_last_entry_of_message_not_log_length():
+    node = make_follower(1, 1, 1)
+    node.handle_message(AppendEntries(1, 2, 0, 0, tuple(entries(1)), 3))
+    assert node.commit_index == 1
+
+
+def test_follower_does_not_commit_when_consistency_check_fails():
+    node = make_follower(1)
+    node.handle_message(AppendEntries(1, 2, 2, 1, (), 1))
+    assert (node.commit_index, node.last_applied) == (0, 0)
+
+
+def test_follower_commit_index_never_goes_backwards():
+    node = make_follower()
+    node.handle_message(AppendEntries(1, 2, 0, 0, tuple(entries(1, 1, 1)), 3))
+    node.handle_message(AppendEntries(1, 2, 0, 0, tuple(entries(1, 1)), 1))
+    node.handle_message(AppendEntries(1, 2, 0, 0, (), 0))
+    node.handle_message(AppendEntries(1, 2, 3, 1, (), 2))
+    assert (node.commit_index, node.last_applied) == (3, 3)

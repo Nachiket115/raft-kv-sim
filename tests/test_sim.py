@@ -247,3 +247,30 @@ def test_restarted_follower_catches_up_on_missed_entries():
     assert leaders(sim) == [leader]
     assert sim.persistent[follower].log == sim.persistent[leader].log
     assert len(sim.persistent[leader].log) == 3
+
+
+def test_commands_sent_to_leader_are_committed_and_applied_on_all_nodes():
+    for seed in range(20):
+        sim, leader = elected(seed)
+        for i in range(5):
+            sim.submit(leader, ClientCommand(i, ("PUT", f"k{i}", i)))
+            sim.run_until(sim.now + 7)
+        sim.run_until(sim.now + 500)
+        for node_id, node in sim.nodes.items():
+            assert (node.commit_index, node.last_applied) == (5, 5), (seed, node_id)
+
+
+def test_restarted_follower_commits_and_applies_what_it_missed():
+    sim, leader = elected(32)
+    follower = next(i for i in sim.nodes if i != leader)
+    sim.crash(follower)
+    for i in range(3):
+        sim.submit(leader, ClientCommand(i, ("PUT", f"k{i}", i)))
+    sim.run_until(sim.now + 100)
+    assert sim.nodes[leader].commit_index == 3
+    sim.restart(follower)
+    assert sim.nodes[follower].commit_index == 0
+    sim.run_until(sim.now + 500)
+    node = sim.nodes[follower]
+    assert (node.commit_index, node.last_applied) == (3, 3)
+    assert node.persistent.log == sim.persistent[leader].log
