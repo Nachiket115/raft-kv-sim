@@ -1,5 +1,5 @@
 from raftlite.messages import ClientCommand, ClientReply, Send, SetTimer, TimerKind
-from raftlite.node import RaftNode, Role
+from raftlite.node import NOOP, RaftNode, Role
 from raftlite.sim import SimConfig, Simulator
 
 
@@ -229,7 +229,7 @@ def test_commands_sent_to_leader_reach_every_log_in_order():
         sim.run_until(sim.now + 500)
         assert leaders(sim) == [leader], seed
         for node_id, persistent in sim.persistent.items():
-            assert [e.command for e in persistent.log] == commands, (seed, node_id)
+            assert [e.command for e in persistent.log] == [NOOP] + commands, (seed, node_id)
 
 
 def test_restarted_follower_catches_up_on_missed_entries():
@@ -241,12 +241,12 @@ def test_restarted_follower_catches_up_on_missed_entries():
     sim.submit(leader, ClientCommand(2, ("PUT", "b", 2)))
     sim.submit(leader, ClientCommand(3, ("DELETE", "a")))
     sim.run_until(sim.now + 100)
-    assert len(sim.persistent[follower].log) == 1
+    assert len(sim.persistent[follower].log) == 2
     sim.restart(follower)
     sim.run_until(sim.now + 500)
     assert leaders(sim) == [leader]
     assert sim.persistent[follower].log == sim.persistent[leader].log
-    assert len(sim.persistent[leader].log) == 3
+    assert len(sim.persistent[leader].log) == 4
 
 
 def test_commands_sent_to_leader_are_committed_and_applied_on_all_nodes():
@@ -257,7 +257,7 @@ def test_commands_sent_to_leader_are_committed_and_applied_on_all_nodes():
             sim.run_until(sim.now + 7)
         sim.run_until(sim.now + 500)
         for node_id, node in sim.nodes.items():
-            assert (node.commit_index, node.last_applied) == (5, 5), (seed, node_id)
+            assert (node.commit_index, node.last_applied) == (6, 6), (seed, node_id)
 
 
 def test_restarted_follower_commits_and_applies_what_it_missed():
@@ -267,12 +267,12 @@ def test_restarted_follower_commits_and_applies_what_it_missed():
     for i in range(3):
         sim.submit(leader, ClientCommand(i, ("PUT", f"k{i}", i)))
     sim.run_until(sim.now + 100)
-    assert sim.nodes[leader].commit_index == 3
+    assert sim.nodes[leader].commit_index == 4
     sim.restart(follower)
     assert sim.nodes[follower].commit_index == 0
     sim.run_until(sim.now + 500)
     node = sim.nodes[follower]
-    assert (node.commit_index, node.last_applied) == (3, 3)
+    assert (node.commit_index, node.last_applied) == (4, 4)
     assert node.persistent.log == sim.persistent[leader].log
 
 
@@ -288,7 +288,7 @@ def test_every_node_applies_the_whole_log_in_order_including_after_restart():
     sim.restart(follower)
     sim.run_until(sim.now + 500)
     expected = [(i, e.command) for i, e in enumerate(sim.persistent[leader].log, 1)]
-    assert len(expected) == 4
+    assert len(expected) == 5
     for node_id, node in sim.nodes.items():
         assert node.applied == expected, node_id
 

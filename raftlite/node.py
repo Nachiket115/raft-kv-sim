@@ -18,6 +18,9 @@ from raftlite.messages import (
 )
 
 
+NOOP = ("NOOP",)
+
+
 class Role(Enum):
     FOLLOWER = "follower"
     CANDIDATE = "candidate"
@@ -134,7 +137,12 @@ class RaftNode:
         self.leader_id = self.node_id
         self.next_index = {peer: self._last_log_index() + 1 for peer in self.peers}
         self.match_index = {peer: 0 for peer in self.peers}
+        self._append_noop()
         return self._broadcast_append_entries() + [SetTimer(TimerKind.HEARTBEAT)]
+
+    def _append_noop(self):
+        self.persistent.log.append(LogEntry(self.persistent.current_term, NOOP))
+        self._advance_commit_index()
 
     def _broadcast_append_entries(self):
         return [Send(peer, self._append_entries_for(peer)) for peer in self.peers]
@@ -243,6 +251,8 @@ class RaftNode:
     def _apply(self, index, entry):
         self.applied.append((index, entry.command))
         request_id = self.pending.pop(index, None)
+        if entry.command == NOOP:
+            return
         try:
             ok, result = True, self.kv.apply(entry.command)
         except ValueError as error:

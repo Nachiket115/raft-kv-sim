@@ -30,7 +30,7 @@ def replicated(seed=41):
     sim.run_until(sim.now + 500)
     follower = next(i for i in sim.nodes if i != leader)
     assert sim.nodes[follower].applied == sim.nodes[leader].applied
-    assert len(sim.nodes[leader].applied) == 3
+    assert len(sim.nodes[leader].applied) == 4
     return sim, leader, follower
 
 
@@ -50,7 +50,7 @@ def test_healthy_run_passes_and_fills_the_checker_history():
     term = sim.persistent[leader].current_term
     assert sim.checker.leaders_by_term == {term: leader}
     assert sim.checker.applied == dict(sim.nodes[follower].applied)
-    assert sorted(sim.checker.committed) == [1, 2, 3, 4]
+    assert sorted(sim.checker.committed) == [1, 2, 3, 4, 5]
 
 
 def test_checker_runs_once_after_every_step():

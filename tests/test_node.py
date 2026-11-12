@@ -14,7 +14,7 @@ from raftlite.messages import (
     SetTimer,
     TimerKind,
 )
-from raftlite.node import PersistentState, RaftNode, Role
+from raftlite.node import NOOP, PersistentState, RaftNode, Role
 
 
 def make_node(node_id=0, persistent=None):
@@ -96,7 +96,8 @@ def make_leader(node_id=0, persistent=None):
 
 def heartbeats(node):
     term = node.persistent.current_term
-    return [Send(peer, AppendEntries(term, node.node_id, 0, 0, (), 0)) for peer in node.peers]
+    log = tuple(node.persistent.log)
+    return [Send(peer, AppendEntries(term, node.node_id, 0, 0, log, 0)) for peer in node.peers]
 
 
 def test_election_timeout_starts_election():
@@ -201,8 +202,9 @@ def test_majority_of_votes_makes_leader_and_resets_leader_state():
     assert node.leader_id == 0
     assert node.next_index == {1: 2, 2: 2, 3: 2, 4: 2}
     assert node.match_index == {1: 0, 2: 0, 3: 0, 4: 0}
+    assert node.persistent.log[-1] == LogEntry(1, NOOP)
     assert effects == [
-        Send(peer, AppendEntries(1, 0, 1, 0, (), 0)) for peer in (1, 2, 3, 4)
+        Send(peer, AppendEntries(1, 0, 1, 0, (LogEntry(1, NOOP),), 0)) for peer in (1, 2, 3, 4)
     ] + [HEARTBEAT]
 
 
@@ -271,7 +273,7 @@ def test_higher_term_makes_leader_step_down_and_restart_election_timer():
 
 def test_leader_stepping_down_for_vote_request_sets_one_election_timer():
     node = make_leader()
-    effects = node.handle_message(RequestVote(2, 3, 0, 0))
+    effects = node.handle_message(RequestVote(2, 3, 1, 1))
     assert effects == [Send(3, RequestVoteResponse(2, 0, True)), ELECTION]
     assert node.role is Role.FOLLOWER
 
@@ -323,9 +325,10 @@ def make_follower(*terms, term=None):
 def test_leader_appends_command_and_sends_it_to_every_peer():
     node = make_leader()
     effects = node.handle_client_command(ClientCommand(7, ("PUT", "a", 1)))
-    entry = LogEntry(1, ("PUT", "a", 1))
-    assert node.persistent.log == [entry]
-    assert effects == [Send(peer, AppendEntries(1, 0, 0, 0, (entry,), 0)) for peer in node.peers]
+    noop, entry = LogEntry(1, NOOP), LogEntry(1, ("PUT", "a", 1))
+    assert node.persistent.log == [noop, entry]
+    sent = (noop, entry)
+    assert effects == [Send(peer, AppendEntries(1, 0, 0, 0, sent, 0)) for peer in node.peers]
 
 
 def test_new_leader_starts_after_its_existing_log():
@@ -333,17 +336,17 @@ def test_new_leader_starts_after_its_existing_log():
     node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
     sent = node.handle_timeout(TimerKind.HEARTBEAT)[0].msg
     assert (sent.prev_log_index, sent.prev_log_term) == (2, 2)
-    assert sent.entries == (LogEntry(3, ("PUT", "a", 1)),)
+    assert sent.entries == (LogEntry(3, NOOP), LogEntry(3, ("PUT", "a", 1)))
 
 
 def test_heartbeat_resends_entries_that_are_not_acknowledged():
     node = make_leader()
     node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
     node.handle_client_command(ClientCommand(2, ("PUT", "b", 2)))
-    node.handle_message(AppendEntriesResponse(1, 1, True, 1))
+    node.handle_message(AppendEntriesResponse(1, 1, True, 2))
     effects = node.handle_timeout(TimerKind.HEARTBEAT)
     log = node.persistent.log
-    assert effects[0] == Send(1, AppendEntries(1, 0, 1, 1, (log[1],), 0))
+    assert effects[0] == Send(1, AppendEntries(1, 0, 2, 1, (log[2],), 0))
     assert effects[1] == Send(2, AppendEntries(1, 0, 0, 0, tuple(log), 0))
 
 
@@ -443,7 +446,7 @@ def test_failure_response_backs_up_and_retries_at_once():
     log = node.persistent.log
     effects = node.handle_message(AppendEntriesResponse(3, 1, False, 0))
     assert node.next_index[1] == 2
-    assert effects == [Send(1, AppendEntries(3, 0, 1, 1, (log[1],), 0))]
+    assert effects == [Send(1, AppendEntries(3, 0, 1, 1, (log[1], log[2]), 0))]
     effects = node.handle_message(AppendEntriesResponse(3, 1, False, 0))
     assert node.next_index[1] == 1
     assert effects == [Send(1, AppendEntries(3, 0, 0, 0, tuple(log), 0))]
@@ -530,7 +533,7 @@ def test_single_node_cluster_commits_at_once():
     assert node.handle_client_command(ClientCommand(1, ("PUT", "a", 1))) == [
         ClientReply(1, ok=True)
     ]
-    assert (node.commit_index, node.last_applied) == (1, 1)
+    assert (node.commit_index, node.last_applied) == (2, 2)
 
 
 def test_follower_commit_follows_leader_commit():
@@ -597,9 +600,9 @@ def test_leader_applies_each_entry_in_order_when_commit_jumps():
     node = make_leader()
     for i in range(3):
         node.handle_client_command(ClientCommand(i, ("PUT", f"k{i}", i)))
-    ack(node, 1, 3)
+    ack(node, 1, 4)
     assert node.applied == []
-    ack(node, 2, 3)
+    ack(node, 2, 4)
     assert node.applied == applied_from(node.persistent.log)
 
 
@@ -647,8 +650,8 @@ def test_leader_replies_with_result_once_entry_commits():
         for e in node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
     )
     node.handle_client_command(ClientCommand(2, ("GET", "a")))
-    assert ack(node, 1, 2) == []
-    assert ack(node, 2, 2) == [ClientReply(1, ok=True), ClientReply(2, ok=True, result=1)]
+    assert ack(node, 1, 3) == []
+    assert ack(node, 2, 3) == [ClientReply(1, ok=True), ClientReply(2, ok=True, result=1)]
     assert node.kv.data == {"a": 1}
 
 
@@ -700,8 +703,8 @@ def test_each_command_gets_its_own_reply_when_commit_jumps():
     node = make_leader()
     for i in range(3):
         node.handle_client_command(ClientCommand(10 + i, ("PUT", f"k{i}", i)))
-    ack(node, 1, 3)
-    replies = replies_of(ack(node, 2, 3))
+    ack(node, 1, 4)
+    replies = replies_of(ack(node, 2, 4))
     assert [r.request_id for r in replies] == [10, 11, 12]
     assert all(r.ok for r in replies)
 
@@ -715,10 +718,10 @@ def test_request_id_zero_still_gets_a_reply():
 def test_reply_is_sent_only_once():
     node = make_leader()
     node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
-    ack(node, 1, 1)
-    assert len(replies_of(ack(node, 2, 1))) == 1
-    assert replies_of(ack(node, 2, 1)) == []
-    assert replies_of(ack(node, 3, 1)) == []
+    ack(node, 1, 2)
+    assert len(replies_of(ack(node, 2, 2))) == 1
+    assert replies_of(ack(node, 2, 2)) == []
+    assert replies_of(ack(node, 3, 2)) == []
     assert replies_of(node.handle_timeout(TimerKind.HEARTBEAT)) == []
 
 
@@ -734,11 +737,11 @@ def test_old_term_entries_committed_under_new_leader_get_no_reply():
     node = make_leader(0, PersistentState(2, None, entries(1, 1)))
     assert node.pending == {}
     node.handle_client_command(ClientCommand(5, ("PUT", "a", 1)))
-    ack(node, 1, 3)
-    effects = ack(node, 2, 3)
-    assert node.commit_index == 3
+    ack(node, 1, 4)
+    effects = ack(node, 2, 4)
+    assert node.commit_index == 4
     assert replies_of(effects) == [ClientReply(5, ok=True)]
-    assert len(node.applied) == 3
+    assert len(node.applied) == 4
 
 
 def test_invalid_command_does_not_stop_later_entries_applying():
@@ -749,7 +752,7 @@ def test_invalid_command_does_not_stop_later_entries_applying():
     last = node.handle_client_command(ClientCommand(3, ("GET", "a")))
     assert [r.ok for r in bad] == [False]
     assert last == [ClientReply(3, ok=True, result=1)]
-    assert (node.commit_index, node.last_applied) == (3, 3)
+    assert (node.commit_index, node.last_applied) == (4, 4)
     assert node.kv.data == {"a": 1}
 
 
@@ -778,3 +781,30 @@ def test_no_reply_is_left_queued_after_any_handler_returns():
     node.handle_timeout(TimerKind.HEARTBEAT)
     node.handle_message(AppendEntries(3, 4, 0, 0, (), 0))
     assert node.replies == []
+
+
+def test_new_leader_commits_old_term_entries_through_its_noop():
+    node = make_leader(0, PersistentState(2, None, entries(1, 1)))
+    assert node.persistent.log[-1] == LogEntry(3, NOOP)
+    ack(node, 1, 2)
+    ack(node, 2, 2)
+    assert node.commit_index == 0
+    ack(node, 1, 3)
+    assert ack(node, 2, 3) == []
+    assert node.commit_index == 3
+    assert node.kv.data == {"k1": 1, "k2": 2}
+
+
+def test_noop_is_applied_without_touching_kv_or_replying():
+    node = make_follower()
+    log = (LogEntry(1, NOOP), LogEntry(1, ("PUT", "a", 1)))
+    effects = node.handle_message(AppendEntries(1, 2, 0, 0, log, 2))
+    assert replies_of(effects) == []
+    assert node.applied == [(1, NOOP), (2, ("PUT", "a", 1))]
+    assert node.kv.data == {"a": 1}
+
+
+def test_single_node_leader_commits_its_noop_at_once():
+    node = RaftNode(0, [0])
+    node.handle_timeout(TimerKind.ELECTION)
+    assert (node.commit_index, node.applied) == (1, [(1, NOOP)])
