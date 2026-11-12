@@ -14,6 +14,10 @@ class SimConfig:
     heartbeat_interval: int = 50
     message_delay_min: int = 1
     message_delay_max: int = 10
+    drop_prob: float = 0.0
+    duplicate_prob: float = 0.0
+    delay_prob: float = 0.0
+    long_delay_max: int = 200
 
 
 class Simulator:
@@ -28,6 +32,7 @@ class Simulator:
         self._queue = []
         self._seq = 0
         self._timer_generation = {}
+        self._group = {}
         self._node_cls = node_cls
         self._node_ids = node_ids = range(node_count)
         self.persistent = {i: PersistentState() for i in node_ids}
@@ -47,6 +52,8 @@ class Simulator:
                     self._apply(node_id, self.nodes[node_id].handle_timeout(kind))
             case ("deliver", src, dst, msg) if dst not in self.nodes:
                 self._log(f"n{src} -> n{dst} dropped {msg}")
+            case ("deliver", src, dst, msg) if not self._connected(src, dst):
+                self._log(f"n{src} -> n{dst} dropped (partition) {msg}")
             case ("deliver", src, dst, msg):
                 self._log(f"n{src} -> n{dst} deliver {msg}")
                 self._apply(dst, self.nodes[dst].handle_message(msg))
@@ -75,6 +82,24 @@ class Simulator:
         self._apply(node_id, node.start())
         self._after_step()
 
+    def partition(self, *groups):
+        listed = [node_id for group in groups for node_id in group]
+        if len(set(listed)) != len(listed) or not set(listed) <= set(self._node_ids):
+            raise ValueError(f"bad partition groups: {groups}")
+        rest = [node_id for node_id in self._node_ids if node_id not in listed]
+        groups = [sorted(group) for group in groups if group] + ([rest] if rest else [])
+        self._group = {node_id: i for i, group in enumerate(groups) for node_id in group}
+        self._log("partition " + " | ".join(str(group) for group in groups))
+        self._after_step()
+
+    def heal(self):
+        self._group = {}
+        self._log("heal")
+        self._after_step()
+
+    def _connected(self, src, dst):
+        return self._group.get(src) == self._group.get(dst)
+
     def submit(self, node_id, cmd):
         self._log(f"client -> n{node_id} {cmd}")
         self._apply(node_id, self.nodes[node_id].handle_client_command(cmd))
@@ -96,16 +121,33 @@ class Simulator:
                     self._push(fire_at, ("timer", node_id, kind, generation))
                     self._log(f"n{node_id} set {kind.value} timer for t={fire_at}")
                 case Send(dst, msg):
-                    delay = self.rng.randint(
-                        self.config.message_delay_min, self.config.message_delay_max
-                    )
-                    self._push(self.now + delay, ("deliver", node_id, dst, msg))
                     self._log(f"n{node_id} -> n{dst} send {msg}")
+                    self._send(node_id, dst, msg)
                 case ClientReply():
                     self.client_replies.append((node_id, effect))
                     self._log(f"n{node_id} -> client {effect}")
                 case _:
                     raise TypeError(f"unknown effect from n{node_id}: {effect!r}")
+
+    def _send(self, src, dst, msg):
+        config = self.config
+        if self._chance(config.drop_prob):
+            self._log(f"n{src} -> n{dst} dropped (fault) {msg}")
+            return
+        copies = 1
+        if self._chance(config.duplicate_prob):
+            copies = 2
+            self._log(f"n{src} -> n{dst} duplicate {msg}")
+        for _ in range(copies):
+            delay = self.rng.randint(config.message_delay_min, config.message_delay_max)
+            if self._chance(config.delay_prob):
+                extra = self.rng.randint(1, config.long_delay_max)
+                delay += extra
+                self._log(f"n{src} -> n{dst} delay +{extra} {msg}")
+            self._push(self.now + delay, ("deliver", src, dst, msg))
+
+    def _chance(self, prob):
+        return prob > 0 and self.rng.random() < prob
 
     def _timer_delay(self, kind):
         if kind is TimerKind.ELECTION:

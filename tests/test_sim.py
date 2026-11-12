@@ -321,3 +321,155 @@ def test_non_leader_in_running_cluster_rejects_with_leader_hint():
     sim.run_until(sim.now + 200)
     sim.submit(follower, ClientCommand(9, ("PUT", "a", 1)))
     assert sim.client_replies[-1] == (follower, ClientReply(9, ok=False, leader_hint=leader))
+
+
+def drain(sim):
+    while any(event[0] == "deliver" for _, _, event in sim._queue):
+        sim.step()
+
+
+def count_lines(sim, word):
+    counts = {}
+    for line in sim.trace:
+        time, rest = line.split(" ", 1)
+        if f" {word} " in rest:
+            key = rest.replace(f" {word} ", " ", 1)
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def test_drop_prob_one_delivers_nothing():
+    sim = Simulator(seed=30, config=SimConfig(drop_prob=1.0), node_cls=PingNode)
+    sim.run_until(1000)
+    drain(sim)
+    assert count_lines(sim, "send")
+    assert count_lines(sim, "dropped (fault)") == count_lines(sim, "send")
+    assert not any(" deliver " in line for line in sim.trace)
+    assert all(not node.received for node in sim.nodes.values())
+
+
+def test_duplicate_prob_one_delivers_every_message_twice():
+    sim = Simulator(seed=31, config=SimConfig(duplicate_prob=1.0), node_cls=PingNode)
+    sim.run_until(1000)
+    drain(sim)
+    sent = count_lines(sim, "send")
+    assert sent
+    assert count_lines(sim, "deliver") == {key: 2 for key in sent}
+
+
+def test_delayed_messages_arrive_within_long_delay_bounds():
+    config = SimConfig(
+        message_delay_min=2, message_delay_max=6, delay_prob=1.0, long_delay_max=100
+    )
+    sim = Simulator(seed=32, config=config, node_cls=PingNode)
+    sim.run_until(1000)
+    drain(sim)
+    sent_at = {}
+    gaps = []
+    for line in sim.trace:
+        time, rest = line.split(" ", 1)
+        if " send " in rest:
+            sent_at[rest.replace(" send ", " ")] = int(time)
+        elif " deliver " in rest:
+            gaps.append(int(time) - sent_at[rest.replace(" deliver ", " ")])
+    assert gaps
+    assert all(3 <= gap <= 106 for gap in gaps)
+    assert max(gaps) > 6
+
+
+def test_partition_blocks_messages_between_groups_until_heal():
+    sim = Simulator(seed=33, node_cls=PingNode)
+    sim.run_until(500)
+    sim.partition([0, 1])
+    for node in sim.nodes.values():
+        node.received.clear()
+    sim.run_until(1500)
+    for node_id, node in sim.nodes.items():
+        senders = {msg[1] for msg in node.received}
+        same_group = {0, 1} if node_id in (0, 1) else {2, 3, 4}
+        assert senders and senders <= same_group, node_id
+    assert any("dropped (partition)" in line for line in sim.trace)
+
+    sim.heal()
+    for node in sim.nodes.values():
+        node.received.clear()
+    sim.run_until(2500)
+    for node_id, node in sim.nodes.items():
+        assert {msg[1] for msg in node.received} == set(sim.nodes) - {node_id}
+
+
+def test_partition_rejects_unknown_or_repeated_nodes():
+    sim = Simulator(seed=34, node_cls=IdleNode)
+    for groups in ([[0, 9]], [[0, 1], [1, 2]]):
+        try:
+            sim.partition(*groups)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(groups)
+
+
+def test_isolated_leader_steps_down_after_heal():
+    for seed in range(20):
+        sim, old = elected(seed)
+        old_term = sim.nodes[old].persistent.current_term
+        sim.partition([old])
+        sim.run_until(sim.now + 2000)
+        new = [i for i in leaders(sim) if i != old]
+        assert len(new) == 1, seed
+        assert sim.nodes[new[0]].persistent.current_term > old_term, seed
+        commit_before = sim.nodes[old].commit_index
+        sim.submit(old, ClientCommand(1, ("PUT", "x", 1)))
+        sim.run_until(sim.now + 500)
+        assert sim.nodes[old].commit_index == commit_before, seed
+
+        sim.heal()
+        sim.run_until(sim.now + 1000)
+        assert leaders(sim) == new, seed
+        assert sim.nodes[old].role is Role.FOLLOWER, seed
+        assert sim.nodes[old].leader_id == new[0], seed
+
+
+def faulty(seed):
+    config = SimConfig(drop_prob=0.1, duplicate_prob=0.1, delay_prob=0.1)
+    return Simulator(seed=seed, config=config)
+
+
+def test_fault_runs_with_same_seed_are_byte_identical():
+    def scripted():
+        sim = faulty(35)
+        sim.run_until(1500)
+        sim.partition([0, 1])
+        sim.run_until(3000)
+        sim.heal()
+        sim.run_until(5000)
+        return sim.trace_text().encode()
+
+    first = scripted()
+    assert first == scripted()
+    assert b"dropped (fault)" in first and b"duplicate" in first and b"delay +" in first
+
+
+def newest_leader(sim):
+    found = leaders(sim)
+    return max(found, key=lambda i: sim.nodes[i].persistent.current_term) if found else None
+
+
+def test_cluster_with_message_faults_still_elects_and_applies_workload():
+    for seed in range(20):
+        sim = faulty(seed)
+        sim.run_until(3000)
+        workload = [("PUT", "a", 1), ("PUT", "b", 2), ("PUT", "a", 3)]
+        for request_id, command in enumerate(workload):
+            for _ in range(20):
+                leader = newest_leader(sim)
+                if leader is not None:
+                    sim.submit(leader, ClientCommand(request_id, command))
+                sim.run_until(sim.now + 300)
+                if any(r.request_id == request_id and r.ok for _, r in sim.client_replies):
+                    break
+            else:
+                raise AssertionError((seed, request_id))
+        sim.run_until(sim.now + 2000)
+        for node_id, node in sim.nodes.items():
+            assert node.kv.data == {"a": 3, "b": 2}, (seed, node_id)
