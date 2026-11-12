@@ -682,3 +682,99 @@ def test_restarted_node_rebuilds_kv_from_log():
     assert node.kv.data == {}
     node.handle_message(AppendEntries(1, 2, 2, 1, (), 2))
     assert node.kv.data == {"a": 1, "b": 2}
+
+
+def replies_of(effects):
+    return [e for e in effects if isinstance(e, ClientReply)]
+
+
+def test_leader_deposed_by_request_vote_clears_pending():
+    node = make_leader()
+    node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    node.handle_message(RequestVote(2, 3, 5, 2))
+    assert node.role is Role.FOLLOWER
+    assert node.pending == {}
+
+
+def test_each_command_gets_its_own_reply_when_commit_jumps():
+    node = make_leader()
+    for i in range(3):
+        node.handle_client_command(ClientCommand(10 + i, ("PUT", f"k{i}", i)))
+    ack(node, 1, 3)
+    replies = replies_of(ack(node, 2, 3))
+    assert [r.request_id for r in replies] == [10, 11, 12]
+    assert all(r.ok for r in replies)
+
+
+def test_request_id_zero_still_gets_a_reply():
+    node = RaftNode(0, [0])
+    node.handle_timeout(TimerKind.ELECTION)
+    assert node.handle_client_command(ClientCommand(0, ("GET", "a"))) == [ClientReply(0, ok=True)]
+
+
+def test_reply_is_sent_only_once():
+    node = make_leader()
+    node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    ack(node, 1, 1)
+    assert len(replies_of(ack(node, 2, 1))) == 1
+    assert replies_of(ack(node, 2, 1)) == []
+    assert replies_of(ack(node, 3, 1)) == []
+    assert replies_of(node.handle_timeout(TimerKind.HEARTBEAT)) == []
+
+
+def test_failure_response_emits_no_reply():
+    node = make_leader()
+    node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    effects = node.handle_message(AppendEntriesResponse(1, 1, False, 0))
+    assert replies_of(effects) == []
+    assert 1 in node.pending.values()
+
+
+def test_old_term_entries_committed_under_new_leader_get_no_reply():
+    node = make_leader(0, PersistentState(2, None, entries(1, 1)))
+    assert node.pending == {}
+    node.handle_client_command(ClientCommand(5, ("PUT", "a", 1)))
+    ack(node, 1, 3)
+    effects = ack(node, 2, 3)
+    assert node.commit_index == 3
+    assert replies_of(effects) == [ClientReply(5, ok=True)]
+    assert len(node.applied) == 3
+
+
+def test_invalid_command_does_not_stop_later_entries_applying():
+    node = RaftNode(0, [0])
+    node.handle_timeout(TimerKind.ELECTION)
+    node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    bad = node.handle_client_command(ClientCommand(2, ("BOGUS",)))
+    last = node.handle_client_command(ClientCommand(3, ("GET", "a")))
+    assert [r.ok for r in bad] == [False]
+    assert last == [ClientReply(3, ok=True, result=1)]
+    assert (node.commit_index, node.last_applied) == (3, 3)
+    assert node.kv.data == {"a": 1}
+
+
+def test_follower_survives_invalid_command_in_log():
+    node = make_follower()
+    log = (LogEntry(1, ("NOPE",)), LogEntry(1, ("PUT", "a", 1)))
+    effects = node.handle_message(AppendEntries(1, 2, 0, 0, log, 2))
+    assert replies_of(effects) == []
+    assert node.kv.data == {"a": 1}
+    assert node.last_applied == 2
+
+
+def test_restarted_node_has_no_pending_or_queued_replies():
+    leader = make_leader()
+    leader.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    fresh = make_node(0, leader.persistent)
+    assert fresh.pending == {} and fresh.replies == []
+    assert fresh.kv.data == {}
+
+
+def test_no_reply_is_left_queued_after_any_handler_returns():
+    node = make_leader()
+    node.handle_client_command(ClientCommand(1, ("PUT", "a", 1)))
+    ack(node, 1, 1)
+    ack(node, 2, 1)
+    node.handle_timeout(TimerKind.HEARTBEAT)
+    node.handle_message(AppendEntries(3, 4, 0, 0, (), 0))
+    assert node.replies == []
