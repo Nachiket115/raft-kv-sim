@@ -19,7 +19,9 @@ class Checker:
         self.leaders_by_term = {}
         self.leader_logs = {}
         self.committed = {}
+        self.ledger = []
         self.applied = {}
+        self.applied_seen = {}
 
     def check(self, sim):
         leaders = [node for node in sim.nodes.values() if node.role is Role.LEADER]
@@ -67,19 +69,29 @@ class Checker:
                     break
 
     def _check_leader_completeness(self, sim, leaders):
+        ledger = self.ledger
         for node in sim.nodes.values():
             term = node.persistent.current_term
-            for index, entry in enumerate(node.persistent.log[: node.commit_index], 1):
-                committed, _ = self.committed.setdefault(index, (entry, term))
-                if committed != entry:
-                    raise InvariantViolation(
-                        "state machine safety",
-                        f"n{node.node_id} committed {entry} at index {index},"
-                        f" where {committed} was committed before",
-                        sim,
-                    )
+            prefix = node.persistent.log[: node.commit_index]
+            if prefix[: len(ledger)] != ledger[: len(prefix)]:
+                index, entry, committed = next(
+                    (index, entry, committed)
+                    for index, (entry, committed) in enumerate(zip(prefix, ledger), 1)
+                    if entry != committed
+                )
+                raise InvariantViolation(
+                    "state machine safety",
+                    f"n{node.node_id} committed {entry} at index {index},"
+                    f" where {committed} was committed before",
+                    sim,
+                )
+            for index in range(len(ledger) + 1, len(prefix) + 1):
+                self.committed[index] = (prefix[index - 1], term)
+                ledger.append(prefix[index - 1])
         for node in leaders:
             log = node.persistent.log
+            if log[: len(ledger)] == ledger:
+                continue
             for index, (entry, term) in self.committed.items():
                 if node.persistent.current_term > term and log[index - 1 : index] != [entry]:
                     raise InvariantViolation(
@@ -91,7 +103,10 @@ class Checker:
 
     def _check_state_machine_safety(self, sim):
         for node in sim.nodes.values():
-            for position, (index, command) in enumerate(node.applied, 1):
+            seen = self.applied_seen.get(node.node_id, [])
+            checked = len(seen) if node.applied[: len(seen)] == seen else 0
+            self.applied_seen[node.node_id] = list(node.applied)
+            for position, (index, command) in enumerate(node.applied[checked:], checked + 1):
                 if index != position:
                     raise InvariantViolation(
                         "state machine safety",
