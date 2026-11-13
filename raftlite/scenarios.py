@@ -227,10 +227,13 @@ def expect_live(sim, request_id):
     )
 
 
-def call_for(name, seed, node_cls):
-    if node_cls is RaftNode:
-        return f"{name}({seed})"
-    return f"{name}({seed}, {node_cls.__qualname__})"
+def call_for(name, seed, node_cls, clients=0):
+    args = [str(seed)]
+    if node_cls is not RaftNode:
+        args.append(node_cls.__qualname__)
+    if clients:
+        args.append(f"clients={clients}")
+    return f"{name}({', '.join(args)})"
 
 
 def wait_leader(sim, among, ticks=3000):
@@ -281,9 +284,10 @@ def figure8(seed, node_cls=RaftNode):
         return sim
 
 
-def fuzz(seed, node_cls=RaftNode, ticks=FUZZ_TICKS):
-    with repro(call_for("fuzz", seed, node_cls), node_cls):
+def fuzz(seed, node_cls=RaftNode, ticks=FUZZ_TICKS, clients=0):
+    with repro(call_for("fuzz", seed, node_cls, clients), node_cls):
         sim = Simulator(seed=seed, config=FUZZ_CONFIG, node_cls=node_cls)
+        sim.add_clients(clients)
         rng = sim.rng
         down = []
         request_id = 0

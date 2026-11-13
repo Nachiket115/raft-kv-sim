@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from raftlite.checker import InvariantViolation
-from raftlite.scenarios import ScenarioFailed, figure8, fuzz
+from raftlite.node import RaftNode
+from raftlite.scenarios import ScenarioFailed, call_for, figure8, fuzz
 from tests import mutants
 
 FUZZ_SEEDS = int(os.environ.get("FUZZ_SEEDS", "100"))
@@ -21,6 +22,47 @@ def test_fuzz_seeds_pass():
 
 def test_fuzz_runs_with_same_seed_are_byte_identical():
     assert fuzz(5).trace_text() == fuzz(5).trace_text()
+
+
+def test_fuzz_seeds_with_clients_pass():
+    for seed in range(FUZZ_SEEDS):
+        fuzz(seed, clients=3)
+
+
+def test_fuzz_runs_with_clients_are_byte_identical_for_a_seed():
+    first = fuzz(5, clients=3).trace_text()
+    assert first == fuzz(5, clients=3).trace_text()
+    assert first != fuzz(5).trace_text()
+
+
+def session_entries(log):
+    return [entry.command[1:3] for entry in log if entry.command and entry.command[0] == "SESSION"]
+
+
+def test_fuzz_with_clients_exercises_retries_and_unanswered_operations():
+    finished = unanswered = logged_twice = 0
+    for seed in range(10):
+        sim = fuzz(seed, clients=3)
+        ops = [op for op in sim.history.values() if isinstance(op.request_id, tuple)]
+        assert {op.request_id[0] for op in ops} == {0, 1, 2}, seed
+        finished += sum(op.ret is not None for op in ops)
+        unanswered += sum(op.ret is None for op in ops)
+        for state in sim.persistent.values():
+            entries = session_entries(state.log)
+            logged_twice += len(entries) - len(set(entries))
+    assert finished > 1000
+    assert unanswered > 0
+    assert logged_twice > 0
+
+
+def test_failure_with_clients_names_them_in_the_repro_command():
+    with pytest.raises(InvariantViolation) as caught:
+        fuzz(0, mutants.NoStepDown, clients=3)
+    assert str(caught.value).endswith(
+        'from tests.mutants import NoStepDown; fuzz(0, NoStepDown, clients=3)"'
+    )
+    assert call_for("fuzz", 4, RaftNode, 3) == "fuzz(4, clients=3)"
+    assert call_for("fuzz", 4, RaftNode) == "fuzz(4)"
 
 
 def failure_kind(error):
