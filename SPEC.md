@@ -44,8 +44,10 @@ raftlite/
   node.py        RaftNode state machine
   messages.py    dataclasses for RPCs and effects
   sim.py         clock, event queue, network, fault injection
-  kv.py          key-value state machine
+  kv.py          key-value state machine and client sessions
+  client.py      simulated retrying client
   checker.py     invariant checker
+  linearizability.py  client history checker
   scenarios.py   named scenarios
   cli.py         run scenarios, print trace
 tests/
@@ -79,16 +81,21 @@ Implemented from the Raft paper:
   leader hint. A command submitted to the leader is appended, replicated,
   committed, then applied to the KV state machine. Reads also go through the
   log for simplicity.
+- Client sessions: a command may carry `(client_id, seq)`. The state machine
+  applies each `(client_id, seq)` once and returns the stored reply to a
+  retry. A `seq` lower than the client's last one is refused.
 
 Out of scope: membership changes, log compaction and snapshots, real disk
-persistence, real sockets, linearizable read optimizations, exactly-once client
-semantics.
+persistence, real sockets, linearizable read optimizations, session expiry.
 
 ## 5. Key-value state machine
 
 Commands: `PUT key value`, `GET key`, `DELETE key`. The state machine is a dict
 applied in log order. Every node applies committed entries in order, so all
 nodes must end with identical state once they have applied the same prefix.
+
+The state machine also holds a session table: per client, the last applied
+`seq` and its reply. It is replicated state, rebuilt by applying the log.
 
 ## 6. Fault injection
 
@@ -122,6 +129,13 @@ A liveness sanity check is tracked in tests: with a stable majority and no new
 faults, a leader is eventually elected and new commands commit within a bounded
 number of virtual ticks.
 
+Checked once at the end of each run rather than per step:
+
+6. **Linearizability:** the recorded client history (invoke tick, return tick
+   or never returned, operation, result) has an order a single correct
+   key-value store could have produced. Operations that never returned may
+   or may not have taken effect.
+
 ## 8. Milestones
 
 Each milestone ends with passing tests.
@@ -146,6 +160,11 @@ Each milestone ends with passing tests.
   seed. That proves the checker works.
 - **M6: tooling and docs.** CLI, optional text timeline of terms and leaders,
   README with design notes and a failure-found-and-fixed story.
+- **M7: client sessions and linearizability.** Session table with dedup, a
+  retrying client driver, recorded client histories and a Wing and Gong
+  checker. Done when 1,000 fuzz seeds with clients pass, runs without clients
+  keep byte-identical traces, and mutants for stale reads, disabled dedup and
+  replying before commit are each caught.
 
 ## 9. Testing
 
@@ -153,13 +172,17 @@ Each milestone ends with passing tests.
 - Scenario tests for named situations: leader partitioned from the majority,
   minority partition cannot commit, crashed follower catches up, split vote
   resolves, stale leader steps down after healing.
-- Fuzz test over many seeds with random faults, checker enabled.
+- Fuzz test over many seeds with random faults, checker enabled, with and
+  without retrying clients.
+- Unit tests for the linearizability checker on hand-written histories, and a
+  test that its sequential model agrees with the KV store.
 - A mutation check: a small list of deliberate bugs that the checker must
   catch.
 
 ## 10. Done criteria
 
-- All five invariants are checked on every step.
+- All five invariants are checked on every step, and linearizability at the
+  end of every run.
 - 1,000 random-fault seeds pass, and the mutation check proves the checker
   catches deliberate bugs.
 - One command runs a named scenario and prints a readable trace.

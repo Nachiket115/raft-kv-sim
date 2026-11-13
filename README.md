@@ -2,8 +2,11 @@
 
 A Raft consensus core with a key-value state machine, run inside a
 deterministic simulator that injects network faults, partitions and crashes.
-An invariant checker runs after every simulated step. The same seed always
-produces the same trace, byte for byte, so any failure can be replayed.
+An invariant checker runs after every simulated step. Simulated clients
+retry their requests, the state machine applies each request once, and a
+linearizability checker judges the recorded client history at the end of
+every run. The same seed always produces the same trace, byte for byte, so
+any failure can be replayed.
 
 Python 3.11+, standard library only. Tests use pytest.
 
@@ -45,7 +48,8 @@ leaders by term:
 PASS leader_partitioned seed=3 ticks=800
 ```
 
-Run the tests (174 tests, about 13 seconds; the fuzz test runs 100 seeds):
+Run the tests (276 tests, about 37 seconds; the fuzz tests run 100 seeds
+without clients and 100 with):
 
 ```bash
 pytest
@@ -64,14 +68,18 @@ raftlite/
   node.py        RaftNode, the pure protocol state machine
   messages.py    RPCs, log entries and effects
   sim.py         virtual clock, event queue, network, faults, crash/restart
-  kv.py          key-value state machine
+  kv.py          key-value state machine and client session table
+  client.py      simulated client that retries and follows leader hints
   checker.py     invariant checker
+  linearizability.py  history checker (Wing and Gong search)
   scenarios.py   named scenarios and the fuzz run, shared by CLI and tests
   cli.py         command-line entry point
   timeline.py    terms-and-leaders view derived from the trace
 tests/
   test_node.py, test_sim.py, test_kv.py, test_checker.py,
-  test_scenarios.py, test_fuzz.py, test_cli.py, test_timeline.py
+  test_scenarios.py, test_fuzz.py, test_cli.py, test_timeline.py,
+  test_client.py, test_linearizability.py
+  test_golden.py pinned trace hashes for runs without clients
   mutants.py     deliberate bugs, each a RaftNode subclass
 ```
 
@@ -168,6 +176,119 @@ run, and crashed nodes' persistent logs still count.
 A violation raises `InvariantViolation` with the invariant name, the seed,
 the tick and the last 30 trace lines.
 
+Logs and applied lists only grow in a healthy run, so the checker remembers
+what it has already checked and looks at the new tail. If a list no longer
+starts with what the checker saw before, it rechecks that list from the
+start.
+
+### Client sessions
+
+A client command is the tuple `("SESSION", client_id, seq, op)`, where `op`
+is a plain `PUT`, `GET` or `DELETE`. A client sends one operation at a time
+and gives each one the next `seq`, starting at 1.
+
+`KVStore` keeps a session table: for each client, the last `seq` it applied
+and the reply it gave. The table is part of the state machine. It is changed
+only by applying log entries, so every node that has applied the same prefix
+has the same table, and a restarted node rebuilds it by re-applying its log.
+Nothing about sessions is stored anywhere else.
+
+When a session command is applied:
+
+- `seq` higher than the last one, or a new client: run the operation, store
+  `(seq, reply)`, reply. A failed operation is stored too, so its retry gets
+  the same failure.
+- `seq` equal to the last one: return the stored reply. The operation is not
+  run again.
+- `seq` lower than the last one: do nothing and reply `ok=False` with
+  `"stale seq"`. The client has already moved on, so it has seen that reply
+  and the stored one is gone. This cannot be told apart from a late copy of
+  an old request, and refusing is the safe answer to both.
+
+Choices worth knowing about:
+
+- **Dedup happens at apply time, not at the leader.** A leader appends a
+  retry like any other command, so the same `(client_id, seq)` can sit in
+  the log twice. The second copy does nothing when applied except return the
+  stored reply. This keeps the rule in one place and makes it hold on every
+  node, including a leader that was elected after the first copy was logged.
+- **No new message fields.** The session data is wrapped inside the command
+  tuple. `LogEntry` and `ClientCommand` are unchanged, so traces of runs
+  without clients did not change by a byte. `tests/test_golden.py` pins
+  SHA-256 hashes of 24 such traces, taken before M7 started.
+- **Commands without a session still work.** A bare `("PUT", ...)` is applied
+  as before, with no dedup. The scripted scenarios use these.
+
+### Client driver
+
+`sim.add_clients(n)` adds clients that run until the simulation ends. Each
+one picks a random operation on key `x` or `y`, sends it, and waits.
+
+- On `ok=True` it stays with that node and sends its next operation after a
+  random pause of 10 to 100 ticks.
+- On a rejection it retries after 10 ticks at the hinted leader, or at a
+  random node if there was no hint.
+- After 300 ticks with no answer it retries at a random node.
+- Every retry carries the same `(client_id, seq)`.
+
+All choices come from the simulator's seeded RNG. A client is an event on the
+same heap as messages and timers. With no clients there are no client events,
+no extra RNG draws and no extra trace lines.
+
+### Linearizability checker
+
+The simulator records one entry per client operation:
+
+- **Invoke tick:** the first time the operation is submitted to any node.
+  Retries do not start a new operation.
+- **Return tick and result:** the first reply produced by applying the
+  command. That includes a stored reply returned to a retry, and results
+  like `False` for a `DELETE` of a missing key. Redirects, rejections from
+  non-leaders and stale-seq replies are not returns.
+- An operation with no such reply is recorded as never returned.
+
+At the end of every scenario and fuzz run, `check_linearizable` looks for an
+order of the operations that a single correct key-value store could have
+produced, where an operation that returned before another was invoked comes
+first. The search follows Wing and Gong:
+
+- Keys are checked one at a time, since operations on different keys do not
+  affect each other.
+- At each point the candidates for "next" are the operations invoked before
+  the earliest return among those not yet placed.
+- A state is the set of placed operations (a bitmask) plus the key's value.
+  States already shown to fail are remembered and not tried again.
+- An operation that never returned may be placed anywhere after its invoke,
+  or left out. Its result is not checked.
+- Two operations that touch at the same tick count as concurrent.
+
+The check runs once per run, not per step, and takes about 0.3 ms for a
+fuzz run of roughly 200 operations.
+
+The sequential model inside the checker is separate from `KVStore` on
+purpose, so a bug in one does not hide in the other. A test replays 200
+random operation lists through both and requires the same results, and
+another compares the search against a brute-force check on 1,500 small
+random histories.
+
+A failure names the key and prints every operation on it:
+
+```
+raftlite.checker.InvariantViolation: linearizability: no valid order for the operations on key 'x':
+  000000 PUT x c1s1  000201 -> None  (request (1, 1))
+  000258 GET x  000258 -> 'c1s1'  (request (0, 2))
+  000260 PUT x c2s2  000272 -> None  (request (2, 2))
+  ...
+  006341 DELETE x  006349 -> True  (request (1, 75)) (seed=1, t=6390)
+  ... last 30 trace lines ...
+repro: python -c "from raftlite.scenarios import *; from tests.mutants import StaleRead; fuzz(1, StaleRead, clients=3)"
+```
+
+Each line is the invoke tick, the operation, the return tick and result (or
+`never returned`), and the request id. The report does not point at the
+operation that broke the order; for a busy key it can be over a hundred
+lines.
+
 ## Testing
 
 - **Unit tests** call `RaftNode` directly with messages, no simulator.
@@ -188,10 +309,14 @@ the tick and the last 30 trace lines.
 - **Fuzz.** `fuzz(seed)` runs 6,000 ticks with 5% drop, duplicate and long
   delay. Every 20 to 300 ticks it picks a random partition, heal, crash (at
   most two nodes down), restart or client write. It ends by healing,
-  restarting every node and checking liveness. 1,000 seeds pass. A longer
+  restarting every node and checking liveness. `fuzz(seed, clients=3)` is
+  the same run with three retrying clients on top. 1,000 seeds pass without
+  clients and 1,000 with. A run with clients takes about 0.19 s against
+  0.02 s without, because it handles about three times as many events. A longer
   hunt of 22,500 runs found nothing: seeds 1,000 to 10,999 plus heavier
   fault mixes (20% faults, up to four nodes down, very long stale messages,
-  near-identical election timeouts, 40,000-tick runs).
+  near-identical election timeouts, 40,000-tick runs). That hunt was run
+  before clients existed and has not been repeated with them.
 - **Mutation check.** Each mutant in `tests/mutants.py` breaks one rule, and
   the test fails unless the checker catches it on some seed within 300. First
   catching seed:
@@ -205,6 +330,17 @@ the tick and the last 30 trace lines.
   | `TruncateOnStale` | truncates on any AppendEntries | leader completeness | 7 |
   | `NoConsistencyCheck` | skips the prev-log check | log matching | 15 |
   | `NoNoop` | no no-op on election | liveness | 18 |
+  | `StaleRead` | leader answers a GET from its own state, not the log | linearizability | 1 |
+  | `DedupDisabled` | a retried `(client_id, seq)` is applied again | linearizability | 1 |
+  | `ReplyBeforeCommit` | leader replies on append, not on commit | linearizability | 0 |
+
+  The last three run with `clients=3`. All three were caught by the fuzz, so
+  none needed a scripted scenario. On the 5 seeds the tests try, they break
+  no Raft invariant and pass the fuzz without clients: only the
+  linearizability check sees them. Of 300
+  seeds, `StaleRead` is caught on 37, `DedupDisabled` on 113 and
+  `ReplyBeforeCommit` on 285. `ReplyBeforeCommit` also fails the liveness
+  check on 15 seeds, which was not looked into.
 
 ### What Figure 8 showed
 
@@ -247,6 +383,13 @@ Found while reviewing the node against Figure 2 of the paper:
   Duplicated or stale failure responses could then cause extra traffic. Now
   nothing is sent unless `next_index` actually moved.
 
+**Sessions and the linearizability checker found no protocol bug.** 1,000
+client fuzz seeds passed the first time they were run. The one mistake they
+were involved in was in the checker's own speed-up: a first version
+remembered only how many applied records it had checked per node, and two
+existing tests that edit an already-checked record failed. It now keeps a
+copy of what it checked and compares.
+
 The scripted Figure 8 scenario had two bugs of its own before it worked:
 it polled for a leader every 10 ticks, so the new leader's first broadcast
 leaked out before the script could isolate it (it now steps one event at a
@@ -271,10 +414,25 @@ the double-quoted `python -c` may need changes in Windows `cmd.exe`.
 
 ## Known simplifications
 
-- **No client request deduplication.** A client that retries resubmits the
-  same command, so a retried command can be logged and applied twice
-  (at-least-once). Harmless for `PUT`; a retried `DELETE` can reply
-  `False`. Exactly-once client semantics are out of scope in the spec.
+- **Sessions never expire.** The session table keeps one row per client
+  forever. There is no expiry, no garbage collection and no way to close a
+  session.
+- **One operation per client at a time.** Dedup compares against the last
+  `seq` only. A client that sent two operations at once could have the
+  older one refused as stale.
+- **Retries still take log space.** A retry is deduplicated when applied,
+  not when the leader receives it, so it costs a log entry.
+- **Clients have no network.** A client's request reaches the node in the
+  same tick and the reply comes back in the same tick it is produced.
+  Client traffic is never dropped, delayed or cut by a partition; a client
+  only fails to reach a node that is crashed. Faults apply between nodes.
+- **The stale-seq reply is not reached in the simulator.** It is unit
+  tested in `KVStore` and `RaftNode`, but with one operation per client and
+  no client network, no late copy of an old request ever arrives.
+- **The linearizability check is weak on the scripted scenarios.** They
+  send bare `PUT`s and no reads, so almost any history passes. The check
+  earns its keep in the client fuzz.
+- **Clients cannot be stopped** once added; they run to the end of the run.
 - **The split-vote scenario is forced.** It splits the vote with a
   partition. Splits from colliding election timers are covered by the
   election tests over many seeds and by the fuzz runs.
