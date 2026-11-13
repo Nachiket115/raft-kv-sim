@@ -1,7 +1,8 @@
 from contextlib import contextmanager
 from dataclasses import replace
 
-from raftlite.checker import TRACE_TAIL
+from raftlite.checker import TRACE_TAIL, InvariantViolation
+from raftlite.linearizability import by_key, failing_key
 from raftlite.messages import ClientCommand
 from raftlite.node import RaftNode, Role
 from raftlite.sim import SimConfig, Simulator
@@ -41,9 +42,27 @@ def repro(call, node_cls=RaftNode):
         raise
 
 
+def describe(op):
+    returned = "never returned" if op.ret is None else f"{op.ret:06d} -> {op.result!r}"
+    return f"  {op.invoke:06d} {' '.join(map(str, op.command))}  {returned}  (request {op.request_id!r})"
+
+
+def check_linearizable(sim):
+    history = list(sim.history.values())
+    key = failing_key(history)
+    if key is not None:
+        ops = sorted(by_key(history)[key], key=lambda op: op.invoke)
+        detail = f"no valid order for the operations on key {key!r}:\n"
+        raise InvariantViolation(
+            "linearizability", detail + "\n".join(describe(op) for op in ops), sim
+        )
+
+
 def run(name, seed):
     with repro(f"run({name!r}, {seed})"):
-        return SCENARIOS[name](seed)
+        sim = SCENARIOS[name](seed)
+        check_linearizable(sim)
+        return sim
 
 
 def leaders(sim, among=None):
@@ -258,6 +277,7 @@ def figure8(seed, node_cls=RaftNode):
         sim.heal()
         sim.restart(old_leader)
         expect_live(sim, 2)
+        check_linearizable(sim)
         return sim
 
 
@@ -291,6 +311,7 @@ def fuzz(seed, node_cls=RaftNode, ticks=FUZZ_TICKS):
         for node_id in sorted(down):
             sim.restart(node_id)
         expect_live(sim, request_id)
+        check_linearizable(sim)
         return sim
 
 
