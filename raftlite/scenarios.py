@@ -90,6 +90,8 @@ def logs_and_state_agree(sim):
             return False
         if node.commit_index != first.commit_index or node.kv.data != first.kv.data:
             return False
+        if node.kv.sessions != first.kv.sessions:
+            return False
     return True
 
 

@@ -253,10 +253,7 @@ class RaftNode:
         request_id = self.pending.pop(index, None)
         if entry.command == NOOP:
             return
-        try:
-            ok, result = True, self.kv.apply(entry.command)
-        except ValueError as error:
-            ok, result = False, str(error)
+        ok, result = self.kv.execute(entry.command)
         if request_id is not None:
             self.replies.append(ClientReply(request_id, ok, result))
 

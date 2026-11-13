@@ -14,6 +14,7 @@ from raftlite.messages import (
     SetTimer,
     TimerKind,
 )
+from raftlite.kv import STALE_SEQ
 from raftlite.node import NOOP, PersistentState, RaftNode, Role
 
 
@@ -808,3 +809,79 @@ def test_single_node_leader_commits_its_noop_at_once():
     node = RaftNode(0, [0])
     node.handle_timeout(TimerKind.ELECTION)
     assert (node.commit_index, node.applied) == (1, [(1, NOOP)])
+
+
+def session(client_id, seq, op):
+    return ("SESSION", client_id, seq, op)
+
+
+def single_leader():
+    node = RaftNode(0, [0])
+    node.handle_timeout(TimerKind.ELECTION)
+    return node
+
+
+def test_session_command_is_applied_and_answered_like_a_plain_one():
+    node = single_leader()
+    put = node.handle_client_command(ClientCommand("p", session(7, 1, ("PUT", "a", 1))))
+    get = node.handle_client_command(ClientCommand("g", session(7, 2, ("GET", "a"))))
+    assert put == [ClientReply("p", ok=True)]
+    assert get == [ClientReply("g", ok=True, result=1)]
+    assert node.kv.sessions == {7: (2, (True, 1))}
+
+
+def test_retried_session_command_is_logged_twice_but_applied_once():
+    node = single_leader()
+    node.handle_client_command(ClientCommand(1, session(7, 1, ("PUT", "a", 1))))
+    delete = ClientCommand(2, session(7, 2, ("DELETE", "a")))
+    assert node.handle_client_command(delete) == [ClientReply(2, ok=True, result=True)]
+    node.handle_client_command(ClientCommand(3, ("PUT", "a", 9)))
+    assert node.handle_client_command(delete) == [ClientReply(2, ok=True, result=True)]
+    assert [entry.command for entry in node.persistent.log].count(delete.command) == 2
+    assert node.kv.data == {"a": 9}
+
+
+def test_retry_is_answered_from_the_table_by_a_leader_that_never_saw_the_first_copy():
+    delete = session(7, 2, ("DELETE", "a"))
+    log = [LogEntry(1, session(7, 1, ("PUT", "a", 1))), LogEntry(1, delete)]
+    node = make_leader(0, PersistentState(1, None, log))
+    node.handle_client_command(ClientCommand("retry", delete))
+    ack(node, 1, 4)
+    assert replies_of(ack(node, 2, 4)) == [ClientReply("retry", ok=True, result=True)]
+    assert node.kv.data == {}
+
+
+def test_older_seq_gets_a_stale_reply_and_changes_nothing():
+    node = single_leader()
+    node.handle_client_command(ClientCommand(1, session(7, 1, ("PUT", "a", 1))))
+    node.handle_client_command(ClientCommand(2, session(7, 2, ("PUT", "a", 2))))
+    late = node.handle_client_command(ClientCommand(3, session(7, 1, ("PUT", "a", 1))))
+    assert late == [ClientReply(3, ok=False, result=STALE_SEQ)]
+    assert node.kv.data == {"a": 2}
+
+
+def test_follower_builds_the_same_session_table_as_the_leader():
+    leader = single_leader()
+    for seq, op in enumerate([("PUT", "a", 1), ("GET", "a"), ("GET", "a"), ("DELETE", "a")], 1):
+        leader.handle_client_command(ClientCommand(seq, session(7 + seq % 2, seq, op)))
+    leader.handle_client_command(ClientCommand(9, session(7, 4, ("DELETE", "a"))))
+    log = tuple(leader.persistent.log)
+    follower = make_follower()
+    follower.handle_message(AppendEntries(1, 2, 0, 0, log, len(log)))
+    assert follower.kv.sessions == leader.kv.sessions != {}
+    assert follower.kv.data == leader.kv.data
+
+
+def test_restarted_node_rebuilds_the_session_table_from_its_log():
+    node = single_leader()
+    delete = session(7, 2, ("DELETE", "a"))
+    node.handle_client_command(ClientCommand(1, session(7, 1, ("PUT", "a", 1))))
+    node.handle_client_command(ClientCommand(2, delete))
+    node.handle_client_command(ClientCommand(3, session(8, 1, ("GET", "a"))))
+    before = dict(node.kv.sessions)
+    restarted = RaftNode(0, [0], node.persistent)
+    assert restarted.kv.sessions == {}
+    restarted.handle_timeout(TimerKind.ELECTION)
+    assert restarted.kv.sessions == before
+    retry = restarted.handle_client_command(ClientCommand("again", delete))
+    assert retry == [ClientReply("again", ok=True, result=True)]
