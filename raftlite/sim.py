@@ -3,6 +3,7 @@ import random
 from dataclasses import dataclass
 
 from raftlite.checker import Checker
+from raftlite.client import Client
 from raftlite.linearizability import ABSENT, Op, step
 from raftlite.messages import ClientReply, Send, SetTimer, TimerKind
 from raftlite.node import PersistentState, RaftNode
@@ -31,6 +32,7 @@ class Simulator:
         self.trace = []
         self.client_replies = []
         self.history = {}
+        self.clients = {}
         self._queue = []
         self._seq = 0
         self._timer_generation = {}
@@ -52,6 +54,10 @@ class Simulator:
                 if self._timer_generation[node_id, kind] == generation:
                     self._log(f"n{node_id} {kind.value} timeout")
                     self._apply(node_id, self.nodes[node_id].handle_timeout(kind))
+            case ("client", client_id, generation):
+                client = self.clients[client_id]
+                if client.generation == generation:
+                    client.wake(self)
             case ("deliver", src, dst, msg) if dst not in self.nodes:
                 self._log(f"n{src} -> n{dst} dropped {msg}")
             case ("deliver", src, dst, msg) if not self._connected(src, dst):
@@ -103,10 +109,29 @@ class Simulator:
         return self._group.get(src) == self._group.get(dst)
 
     def submit(self, node_id, cmd):
+        self._deliver_command(node_id, cmd)
+        self._after_step()
+
+    def add_clients(self, count, keys=("x", "y")):
+        for client_id in range(len(self.clients), len(self.clients) + count):
+            self.clients[client_id] = Client(client_id, keys)
+            self.wake_client(self.clients[client_id], 0)
+
+    def wake_client(self, client, delay):
+        client.generation += 1
+        self._push(self.now + delay, ("client", client.client_id, client.generation))
+
+    def client_send(self, node_id, cmd):
+        if node_id not in self.nodes:
+            self._log(f"client -> n{node_id} unreachable {cmd}")
+            return False
+        self._deliver_command(node_id, cmd)
+        return True
+
+    def _deliver_command(self, node_id, cmd):
         self._log(f"client -> n{node_id} {cmd}")
         self._record_invoke(cmd)
         self._apply(node_id, self.nodes[node_id].handle_client_command(cmd))
-        self._after_step()
 
     def _record_invoke(self, cmd):
         match cmd.command:
@@ -146,6 +171,8 @@ class Simulator:
                 case ClientReply():
                     self.client_replies.append((node_id, effect))
                     self._record_return(effect)
+                    for client in self.clients.values():
+                        client.on_reply(self, node_id, effect)
                     self._log(f"n{node_id} -> client {effect}")
                 case _:
                     raise TypeError(f"unknown effect from n{node_id}: {effect!r}")
