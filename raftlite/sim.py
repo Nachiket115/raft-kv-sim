@@ -3,6 +3,7 @@ import random
 from dataclasses import dataclass
 
 from raftlite.checker import Checker
+from raftlite.linearizability import ABSENT, Op, step
 from raftlite.messages import ClientReply, Send, SetTimer, TimerKind
 from raftlite.node import PersistentState, RaftNode
 
@@ -29,6 +30,7 @@ class Simulator:
         self.now = 0
         self.trace = []
         self.client_replies = []
+        self.history = {}
         self._queue = []
         self._seq = 0
         self._timer_generation = {}
@@ -102,8 +104,26 @@ class Simulator:
 
     def submit(self, node_id, cmd):
         self._log(f"client -> n{node_id} {cmd}")
+        self._record_invoke(cmd)
         self._apply(node_id, self.nodes[node_id].handle_client_command(cmd))
         self._after_step()
+
+    def _record_invoke(self, cmd):
+        match cmd.command:
+            case ("SESSION", _, _, op):
+                pass
+            case op:
+                pass
+        try:
+            step(ABSENT, op)
+        except ValueError:
+            return
+        self.history.setdefault(cmd.request_id, Op(op, self.now, request_id=cmd.request_id))
+
+    def _record_return(self, reply):
+        op = self.history.get(reply.request_id)
+        if reply.ok and op is not None and op.ret is None:
+            op.ret, op.result = self.now, reply.result
 
     def _after_step(self):
         self.checker.check(self)
@@ -125,6 +145,7 @@ class Simulator:
                     self._send(node_id, dst, msg)
                 case ClientReply():
                     self.client_replies.append((node_id, effect))
+                    self._record_return(effect)
                     self._log(f"n{node_id} -> client {effect}")
                 case _:
                     raise TypeError(f"unknown effect from n{node_id}: {effect!r}")

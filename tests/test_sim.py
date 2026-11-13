@@ -475,3 +475,89 @@ def test_cluster_with_message_faults_still_elects_and_applies_workload():
         sim.run_until(sim.now + 2000)
         for node_id, node in sim.nodes.items():
             assert node.kv.data == {"a": 3, "b": 2}, (seed, node_id)
+
+
+def session(client_id, seq, op):
+    return ("SESSION", client_id, seq, op)
+
+
+def test_history_records_invoke_and_return_ticks_with_the_result():
+    sim, leader = elected(1)
+    sim.submit(leader, ClientCommand(1, ("PUT", "a", 1)))
+    invoked = sim.now
+    assert sim.history[1].ret is None
+    sim.run_until(sim.now + 200)
+    sim.submit(leader, ClientCommand(2, ("GET", "a")))
+    sim.run_until(sim.now + 200)
+    put, get = sim.history[1], sim.history[2]
+    assert (put.command, put.invoke, put.result) == (("PUT", "a", 1), invoked, None)
+    assert invoked < put.ret <= invoked + 200
+    assert (get.command, get.result, get.request_id) == (("GET", "a"), 1, 2)
+    assert put.ret < get.invoke < get.ret
+
+
+def test_redirect_is_not_a_return_and_the_retry_is_the_same_operation():
+    sim, leader = elected(2)
+    follower = next(i for i in sim.nodes if i != leader)
+    sim.submit(follower, ClientCommand(1, ("PUT", "a", 1)))
+    first_try = sim.now
+    assert sim.client_replies[-1][1] == ClientReply(1, ok=False, leader_hint=leader)
+    assert sim.history[1].ret is None
+    sim.run_until(sim.now + 100)
+    sim.submit(leader, ClientCommand(1, ("PUT", "a", 1)))
+    sim.run_until(sim.now + 200)
+    assert list(sim.history) == [1]
+    assert sim.history[1].invoke == first_try
+    assert sim.history[1].ret > first_try + 100
+
+
+def test_retried_session_command_is_one_operation_returning_at_the_first_reply():
+    sim, leader = elected(3)
+    sim.submit(leader, ClientCommand("p", session(7, 1, ("PUT", "a", 1))))
+    sim.run_until(sim.now + 200)
+    delete = ClientCommand((7, 2), session(7, 2, ("DELETE", "a")))
+    sim.submit(leader, delete)
+    sim.run_until(sim.now + 200)
+    returned = sim.history[7, 2].ret
+    sim.submit(leader, delete)
+    sim.run_until(sim.now + 200)
+    replies = [reply for _, reply in sim.client_replies if reply.request_id == (7, 2)]
+    assert replies == [ClientReply((7, 2), ok=True, result=True)] * 2
+    assert list(sim.history) == ["p", (7, 2)]
+    op = sim.history[7, 2]
+    assert (op.command, op.ret, op.result) == (("DELETE", "a"), returned, True)
+
+
+def test_delete_of_a_missing_key_returns_false_and_is_recorded():
+    sim, leader = elected(4)
+    sim.submit(leader, ClientCommand(1, ("DELETE", "nope")))
+    sim.run_until(sim.now + 200)
+    assert sim.history[1].ret is not None
+    assert sim.history[1].result is False
+
+
+def test_stale_seq_reply_is_not_a_return():
+    sim, leader = elected(5)
+    sim.submit(leader, ClientCommand("new", session(7, 2, ("PUT", "a", 2))))
+    sim.run_until(sim.now + 200)
+    sim.submit(leader, ClientCommand("old", session(7, 1, ("PUT", "a", 1))))
+    sim.run_until(sim.now + 200)
+    assert sim.client_replies[-1][1].ok is False
+    assert sim.history["old"].ret is None
+    assert sim.history["new"].ret is not None
+
+
+def test_invalid_command_is_not_in_the_history():
+    sim, leader = elected(6)
+    sim.submit(leader, ClientCommand(1, ("INCR", "a")))
+    sim.submit(leader, ClientCommand(2, session(7, 1, ("PUT", "a"))))
+    sim.run_until(sim.now + 200)
+    assert sim.history == {}
+
+
+def test_operation_that_never_commits_never_returns():
+    sim, leader = elected(7)
+    sim.partition([leader])
+    sim.submit(leader, ClientCommand(1, ("PUT", "a", 1)))
+    sim.run_until(sim.now + 2000)
+    assert sim.history[1].ret is None
