@@ -79,13 +79,17 @@ def failure_kind(error):
         (mutants.TruncateOnStale, "leader completeness"),
         (mutants.NoConsistencyCheck, "log matching"),
         (mutants.NoNoop, "liveness"),
+        (mutants.StaleRead, "linearizability"),
+        (mutants.DedupDisabled, "linearizability"),
+        (mutants.ReplyBeforeCommit, "linearizability"),
     ],
     ids=lambda value: getattr(value, "__name__", value),
 )
 def test_mutant_is_caught_on_some_seed(mutant, kind):
+    clients = 3 if kind == "linearizability" else 0
     for seed in range(MUTANT_SEED_CAP):
         try:
-            fuzz(seed, mutant)
+            fuzz(seed, mutant, clients=clients)
         except (InvariantViolation, ScenarioFailed) as error:
             if failure_kind(error) == kind:
                 assert f"seed={seed}" in str(error)
@@ -93,6 +97,30 @@ def test_mutant_is_caught_on_some_seed(mutant, kind):
         except IndexError:
             pass
     pytest.fail(f"{mutant.__name__} never broke {kind} in {MUTANT_SEED_CAP} seeds")
+
+
+@pytest.mark.parametrize(
+    "mutant", [mutants.StaleRead, mutants.DedupDisabled, mutants.ReplyBeforeCommit]
+)
+def test_client_mutants_break_no_raft_invariant_and_pass_without_clients(mutant):
+    for seed in range(5):
+        fuzz(seed, mutant)
+        try:
+            fuzz(seed, mutant, clients=3)
+        except InvariantViolation as error:
+            assert error.invariant == "linearizability", seed
+        except ScenarioFailed:
+            pass
+
+
+def test_linearizability_failure_shows_the_key_history_and_a_repro_command():
+    with pytest.raises(InvariantViolation) as caught:
+        fuzz(1, mutants.StaleRead, clients=3)
+    message = str(caught.value)
+    assert "no valid order for the operations on key 'x'" in message
+    assert "seed=1" in message
+    assert " GET x  " in message and "(request (" in message
+    assert message.endswith('from tests.mutants import StaleRead; fuzz(1, StaleRead, clients=3)"')
 
 
 def test_failure_prints_a_repro_command_that_reproduces_it():

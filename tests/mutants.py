@@ -1,3 +1,7 @@
+from copy import deepcopy
+
+from raftlite.kv import KVStore
+from raftlite.messages import ClientReply
 from raftlite.node import RaftNode, Role
 
 
@@ -41,7 +45,6 @@ class NoNoop(RaftNode):
         pass
 
 
-
 class CommitOldTerm(RaftNode):
     def _can_commit(self, index):
         replicas = 1 + sum(1 for match in self.match_index.values() if match >= index)
@@ -50,3 +53,31 @@ class CommitOldTerm(RaftNode):
 
 class CommitOldTermNoNoop(CommitOldTerm, NoNoop):
     pass
+
+
+class StaleRead(RaftNode):
+    def handle_client_command(self, cmd):
+        match cmd.command:
+            case ("SESSION", _, _, ("GET", key)) if self.role is Role.LEADER:
+                return [ClientReply(cmd.request_id, True, self.kv.data.get(key))]
+        return super().handle_client_command(cmd)
+
+
+class ForgetfulKVStore(KVStore):
+    def _is_duplicate(self, seq, last_seq):
+        return False
+
+
+class DedupDisabled(RaftNode):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kv = ForgetfulKVStore()
+
+
+class ReplyBeforeCommit(RaftNode):
+    def handle_client_command(self, cmd):
+        effects = super().handle_client_command(cmd)
+        if self._last_log_index() in self.pending:
+            del self.pending[self._last_log_index()]
+            effects.append(ClientReply(cmd.request_id, *deepcopy(self.kv).execute(cmd.command)))
+        return effects
