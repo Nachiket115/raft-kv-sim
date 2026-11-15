@@ -14,6 +14,8 @@ HAND = [
     "000300 n1 restart",
     "000400 partition [0] | [1, 2]",
     "000500 heal",
+    "000600 cut n0-n2",
+    "000700 restore n0-n2",
 ]
 
 
@@ -25,6 +27,8 @@ def test_hand_written_trace():
         "000300  n1 restart\n"
         "000400  partition [0] | [1, 2]\n"
         "000500  heal\n"
+        "000600  cut n0-n2\n"
+        "000700  restore n0-n2\n"
         "\n"
         "leaders by term:\n"
         "  term 1: n1\n"

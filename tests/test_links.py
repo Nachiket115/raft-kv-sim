@@ -15,7 +15,8 @@ def clear(sim):
 
 
 def test_cut_link_blocks_only_that_pair_in_both_directions():
-    sim = Simulator(seed=33, node_cls=PingNode)
+    spy = Spy()
+    sim = Simulator(seed=33, node_cls=PingNode, observer=spy)
     sim.run_until(500)
     sim.cut_link(0, 1)
     clear(sim)
@@ -24,8 +25,9 @@ def test_cut_link_blocks_only_that_pair_in_both_directions():
     assert heard[0] == {2, 3, 4}
     assert heard[1] == {2, 3, 4}
     assert heard[2] == {0, 1, 3, 4}
-    assert any(" n0 -> n1 dropped (partition) " in line for line in sim.trace)
-    assert any(" n1 -> n0 dropped (partition) " in line for line in sim.trace)
+    assert any(" n0 -> n1 dropped (cut) " in line for line in sim.trace)
+    assert any(" n1 -> n0 dropped (cut) " in line for line in sim.trace)
+    assert spy.count("drop", reason="cut") > 0 == spy.count("drop", reason="partition")
 
 
 def test_restored_link_delivers_again():

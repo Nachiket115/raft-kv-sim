@@ -66,6 +66,12 @@ class Simulator:
                 self._log(f"n{src} -> n{dst} dropped {msg}")
                 if self._observer is not None:
                     self._observer.event("drop", src=src, dst=dst, msg=msg, reason="down")
+            case ("deliver", src, dst, msg) if (
+                self._cut and (min(src, dst), max(src, dst)) in self._cut
+            ):
+                self._log(f"n{src} -> n{dst} dropped (cut) {msg}")
+                if self._observer is not None:
+                    self._observer.event("drop", src=src, dst=dst, msg=msg, reason="cut")
             case ("deliver", src, dst, msg) if not self._connected(src, dst):
                 self._log(f"n{src} -> n{dst} dropped (partition) {msg}")
                 if self._observer is not None:
@@ -145,8 +151,6 @@ class Simulator:
         return (min(a, b), max(a, b))
 
     def _connected(self, src, dst):
-        if self._cut and (min(src, dst), max(src, dst)) in self._cut:
-            return False
         return self._group.get(src) == self._group.get(dst)
 
     def submit(self, node_id, cmd):

@@ -2,7 +2,7 @@ import re
 
 SEND_AE = re.compile(r"^(\d+) n(\d+) -> n\d+ send AppendEntries\(term=(\d+), leader_id=(\d+)")
 SEND_RV = re.compile(r"^(\d+) n(\d+) -> n\d+ send RequestVote\(term=(\d+), candidate_id=(\d+)")
-EVENT = re.compile(r"^(\d+) (n\d+ (?:crash|restart)|partition .*|heal)$")
+EVENT = re.compile(r"^(\d+) (n\d+ (?:crash|restart)|partition .*|heal|(?:cut|restore) n\d+-n\d+)$")
 
 
 def timeline(trace):

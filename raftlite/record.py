@@ -19,14 +19,16 @@ KINDS = {
 NODE_FIELDS = ("alive", "role", "term", "voted", "commit", "applied")
 
 
+def words(value):
+    return " ".join(map(str, value)) if isinstance(value, tuple) else str(value)
+
+
 def label(value):
     match value:
         case ("SESSION", client_id, seq, op):
-            text = f"c{client_id}#{seq} " + " ".join(map(str, op))
-        case tuple():
-            text = " ".join(map(str, value))
+            text = f"c{client_id}#{seq} {words(op)}"
         case _:
-            text = str(value)
+            text = words(value)
     return text if len(text) <= LABEL_MAX else text[: LABEL_MAX - 1] + "…"
 
 
@@ -102,12 +104,9 @@ class Recorder:
             self._pending = {"t": sim.now, "events": self._events, "nodes": nodes}
         self._events = []
 
-    def finish(self, now, violation=None):
+    def finish(self, violation=None):
         if violation is not None:
-            if self._pending is not None and self._pending["t"] != now:
-                self._flush()
-            if self._pending is None:
-                self._pending = {"t": now, "events": [], "nodes": self._shown}
+            self.snapshot(self.sim)
             self._events.append({"k": "violation", **violation})
         if self._pending is not None:
             self._pending["events"] += self._events
@@ -169,13 +168,18 @@ def record(call, meta):
     try:
         call()
         violation = None
-    except (InvariantViolation, ScenarioFailed) as error:
-        invariant = getattr(error, "invariant", "liveness")
-        violation = {"invariant": invariant, "detail": detail(error), "tick": recorder.sim.now}
+    except Exception as error:
+        if recorder.sim is None:
+            raise
+        if isinstance(error, (InvariantViolation, ScenarioFailed)):
+            invariant, text = getattr(error, "invariant", "liveness"), detail(error)
+        else:
+            invariant, text = "error", f"{type(error).__name__}: {error}"
+        violation = {"invariant": invariant, "detail": text, "tick": recorder.sim.now}
     finally:
         scenarios.Simulator = original
     now = recorder.sim.now
-    recorder.finish(now, violation and {key: violation[key] for key in ("invariant", "detail")})
+    recorder.finish(violation and {key: violation[key] for key in ("invariant", "detail")})
     nodes = sorted({n["id"] for f in recorder.frames if f.get("key") for n in f["nodes"]})
     meta |= {
         "nodes": nodes,

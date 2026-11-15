@@ -59,7 +59,7 @@ def recorded_fuzz(seed, clients=0):
         sim = scenarios.fuzz(seed, clients=clients)
     finally:
         scenarios.Simulator = original
-    recorder.finish(sim.now)
+    recorder.finish()
     return sim, recorder
 
 
@@ -167,6 +167,21 @@ def test_failed_expectation_is_recorded_as_liveness():
     assert recording["meta"]["mutant"] == "NoNoop"
 
 
+def test_unexpected_error_is_recorded_with_the_state_at_the_raise():
+    def call():
+        sim = scenarios.Simulator(seed=1)
+        sim.run_until(500)
+        sim.persistent[0].current_term = 99
+        raise RuntimeError("boom")
+
+    meta = {"name": "boom", "seed": 1, "source": "scenario", "mutant": None}
+    recording = validate(record.record(call, meta))
+    assert meta["violation"] == {"invariant": "error", "detail": "RuntimeError: boom", "tick": 500}
+    assert recording["frames"][-1]["t"] == 500
+    assert final_state(recording["frames"])[0]["term"] == 99
+    assert scenarios.Simulator is Simulator
+
+
 def test_violation_detail_keeps_multiline_text_but_not_the_trace():
     recording = record_fuzz(1, mutants.StaleRead, clients=3)
     text = recording["meta"]["violation"]["detail"]
@@ -185,6 +200,7 @@ def test_bad_arguments_are_rejected_and_the_simulator_is_restored():
 def test_labels_are_short_and_readable():
     assert label(("NOOP",)) == "NOOP"
     assert label(("SESSION", 2, 7, ("PUT", "x", "c2s7"))) == "c2#7 PUT x c2s7"
+    assert label(("SESSION", 2, 7, None)) == "c2#7 None"
     assert label(("PUT", "k" * 40, 1)) == "PUT " + "k" * 15 + "…"
     assert len(label("y" * 100)) == record.LABEL_MAX
 
