@@ -23,11 +23,14 @@ class SimConfig:
 
 
 class Simulator:
-    def __init__(self, node_count=5, seed=0, config=None, node_cls=RaftNode, checker=None):
+    def __init__(
+        self, node_count=5, seed=0, config=None, node_cls=RaftNode, checker=None, observer=None
+    ):
         self.seed = seed
         self.config = config or SimConfig()
         self.rng = random.Random(seed)
         self.checker = checker or Checker()
+        self._observer = observer
         self.now = 0
         self.trace = []
         self.client_replies = []
@@ -60,10 +63,16 @@ class Simulator:
                     client.wake(self)
             case ("deliver", src, dst, msg) if dst not in self.nodes:
                 self._log(f"n{src} -> n{dst} dropped {msg}")
+                if self._observer is not None:
+                    self._observer.event("drop", src=src, dst=dst, msg=msg, reason="down")
             case ("deliver", src, dst, msg) if not self._connected(src, dst):
                 self._log(f"n{src} -> n{dst} dropped (partition) {msg}")
+                if self._observer is not None:
+                    self._observer.event("drop", src=src, dst=dst, msg=msg, reason="partition")
             case ("deliver", src, dst, msg):
                 self._log(f"n{src} -> n{dst} deliver {msg}")
+                if self._observer is not None:
+                    self._observer.event("deliver", src=src, dst=dst, msg=msg)
                 self._apply(dst, self.nodes[dst].handle_message(msg))
         self._after_step()
         return True
@@ -79,6 +88,8 @@ class Simulator:
             if key[0] == node_id:
                 self._timer_generation[key] += 1
         self._log(f"n{node_id} crash")
+        if self._observer is not None:
+            self._observer.event("crash", node=node_id)
         self._after_step()
 
     def restart(self, node_id):
@@ -87,6 +98,8 @@ class Simulator:
         node = self._node_cls(node_id, self._node_ids, self.persistent[node_id])
         self.nodes = dict(sorted({**self.nodes, node_id: node}.items()))
         self._log(f"n{node_id} restart")
+        if self._observer is not None:
+            self._observer.event("restart", node=node_id)
         self._apply(node_id, node.start())
         self._after_step()
 
@@ -98,11 +111,15 @@ class Simulator:
         groups = [sorted(group) for group in groups if group] + ([rest] if rest else [])
         self._group = {node_id: i for i, group in enumerate(groups) for node_id in group}
         self._log("partition " + " | ".join(str(group) for group in groups))
+        if self._observer is not None:
+            self._observer.event("partition", groups=groups)
         self._after_step()
 
     def heal(self):
         self._group = {}
         self._log("heal")
+        if self._observer is not None:
+            self._observer.event("heal")
         self._after_step()
 
     def _connected(self, src, dst):
@@ -131,6 +148,8 @@ class Simulator:
     def _deliver_command(self, node_id, cmd):
         self._log(f"client -> n{node_id} {cmd}")
         self._record_invoke(cmd)
+        if self._observer is not None:
+            self._observer.event("invoke", node=node_id, cmd=cmd)
         self._apply(node_id, self.nodes[node_id].handle_client_command(cmd))
 
     def _record_invoke(self, cmd):
@@ -151,6 +170,8 @@ class Simulator:
             op.ret, op.result = self.now, reply.result
 
     def _after_step(self):
+        if self._observer is not None:
+            self._observer.snapshot(self)
         self.checker.check(self)
 
     def trace_text(self):
@@ -165,6 +186,8 @@ class Simulator:
                     fire_at = self.now + self._timer_delay(kind)
                     self._push(fire_at, ("timer", node_id, kind, generation))
                     self._log(f"n{node_id} set {kind.value} timer for t={fire_at}")
+                    if self._observer is not None:
+                        self._observer.event("timer", node=node_id, timer=kind, fires=fire_at)
                 case Send(dst, msg):
                     self._log(f"n{node_id} -> n{dst} send {msg}")
                     self._send(node_id, dst, msg)
@@ -174,6 +197,8 @@ class Simulator:
                     for client in self.clients.values():
                         client.on_reply(self, node_id, effect)
                     self._log(f"n{node_id} -> client {effect}")
+                    if self._observer is not None:
+                        self._observer.event("return", node=node_id, reply=effect)
                 case _:
                     raise TypeError(f"unknown effect from n{node_id}: {effect!r}")
 
@@ -181,18 +206,26 @@ class Simulator:
         config = self.config
         if self._chance(config.drop_prob):
             self._log(f"n{src} -> n{dst} dropped (fault) {msg}")
+            if self._observer is not None:
+                self._observer.event("drop", src=src, dst=dst, msg=msg, reason="fault")
             return
         copies = 1
         if self._chance(config.duplicate_prob):
             copies = 2
             self._log(f"n{src} -> n{dst} duplicate {msg}")
+            if self._observer is not None:
+                self._observer.event("duplicate", src=src, dst=dst, msg=msg)
         for _ in range(copies):
             delay = self.rng.randint(config.message_delay_min, config.message_delay_max)
             if self._chance(config.delay_prob):
                 extra = self.rng.randint(1, config.long_delay_max)
                 delay += extra
                 self._log(f"n{src} -> n{dst} delay +{extra} {msg}")
+                if self._observer is not None:
+                    self._observer.event("delay", src=src, dst=dst, msg=msg, extra=extra)
             self._push(self.now + delay, ("deliver", src, dst, msg))
+            if self._observer is not None:
+                self._observer.event("send", src=src, dst=dst, msg=msg, arrive=self.now + delay)
 
     def _chance(self, prob):
         return prob > 0 and self.rng.random() < prob
