@@ -40,6 +40,7 @@ class Simulator:
         self._seq = 0
         self._timer_generation = {}
         self._group = {}
+        self._cut = set()
         self._node_cls = node_cls
         self._node_ids = node_ids = range(node_count)
         self.persistent = {i: PersistentState() for i in node_ids}
@@ -122,7 +123,30 @@ class Simulator:
             self._observer.event("heal")
         self._after_step()
 
+    def cut_link(self, a, b):
+        pair = self._link(a, b)
+        self._cut.add(pair)
+        self._log(f"cut n{pair[0]}-n{pair[1]}")
+        if self._observer is not None:
+            self._observer.event("cut", a=pair[0], b=pair[1])
+        self._after_step()
+
+    def restore_link(self, a, b):
+        pair = self._link(a, b)
+        self._cut.discard(pair)
+        self._log(f"restore n{pair[0]}-n{pair[1]}")
+        if self._observer is not None:
+            self._observer.event("restore", a=pair[0], b=pair[1])
+        self._after_step()
+
+    def _link(self, a, b):
+        if a == b or a not in self._node_ids or b not in self._node_ids:
+            raise ValueError(f"bad link: n{a}-n{b}")
+        return (min(a, b), max(a, b))
+
     def _connected(self, src, dst):
+        if self._cut and (min(src, dst), max(src, dst)) in self._cut:
+            return False
         return self._group.get(src) == self._group.get(dst)
 
     def submit(self, node_id, cmd):
