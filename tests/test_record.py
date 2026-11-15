@@ -182,6 +182,21 @@ def test_unexpected_error_is_recorded_with_the_state_at_the_raise():
     assert scenarios.Simulator is Simulator
 
 
+def test_record_refuses_to_nest():
+    with pytest.raises(RuntimeError, match="cannot be nested"):
+        record.record(partial(record_fuzz, 0), {})
+    assert scenarios.Simulator is Simulator
+
+
+def test_drop_events_carry_type_term_and_reason():
+    recording = record_fuzz(0, clients=3)
+    drops = [e for frame in recording["frames"] for e in frame["events"] if e["k"] == "drop"]
+    assert {drop["reason"] for drop in drops} == {"fault", "partition", "down"}
+    for drop in drops:
+        assert drop["type"] in ("RequestVote", "RequestVoteResponse", "AppendEntries", "AppendEntriesResponse")
+        assert isinstance(drop["term"], int) and drop["term"] >= 1
+
+
 def test_violation_detail_keeps_multiline_text_but_not_the_trace():
     recording = record_fuzz(1, mutants.StaleRead, clients=3)
     text = recording["meta"]["violation"]["detail"]

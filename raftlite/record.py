@@ -62,6 +62,7 @@ class Recorder:
                 entry = {"src": fields["src"], "dst": fields["dst"], "type": type(fields["msg"]).__name__}
                 if kind == "drop":
                     entry["reason"] = fields["reason"]
+                    entry["term"] = fields["msg"].term
                 if kind == "delay":
                     entry["extra"] = fields["extra"]
             case "timer":
@@ -162,6 +163,8 @@ def detail(error):
 
 
 def record(call, meta):
+    if scenarios.Simulator is not Simulator:
+        raise RuntimeError("record() is already running; it cannot be nested")
     recorder = Recorder()
     original = scenarios.Simulator
     scenarios.Simulator = partial(Simulator, observer=recorder)

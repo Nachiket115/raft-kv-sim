@@ -5,7 +5,8 @@ from functools import partial
 import pytest
 
 from raftlite import scenarios
-from raftlite.sim import Simulator
+from raftlite.record import Recorder
+from raftlite.sim import SimConfig, Simulator
 from tests.test_golden import GOLDEN
 
 TRACE_LINES = {
@@ -63,11 +64,34 @@ def test_observed_run_matches_the_pinned_trace(name, seed, monkeypatch):
     assert spy.events and spy.snapshots
 
 
-@pytest.mark.parametrize("seed", range(3))
-def test_observed_client_fuzz_matches_the_unobserved_trace(seed, monkeypatch):
-    plain = scenarios.fuzz(seed, clients=3)
-    observed(monkeypatch)
-    assert scenarios.fuzz(seed, clients=3).trace == plain.trace
+def internals(sim):
+    return sim.trace, sim.rng.getstate(), sim._seq, sim._queue, sim._timer_generation
+
+
+@pytest.mark.parametrize(
+    "name, seed", [*GOLDEN, *(("client fuzz", seed) for seed in range(3))], ids=str
+)
+def test_recorder_leaves_simulator_internals_unchanged(name, seed, monkeypatch):
+    def run():
+        if name == "client fuzz":
+            return scenarios.fuzz(seed, clients=3)
+        return scenarios.fuzz(seed) if name == "fuzz" else scenarios.run(name, seed)
+
+    plain = run()
+    monkeypatch.setattr(scenarios, "Simulator", partial(Simulator, observer=Recorder()))
+    assert internals(run()) == internals(plain)
+
+
+def test_each_delay_comes_right_before_the_send_it_delays():
+    spy = Spy()
+    config = SimConfig(duplicate_prob=0.5, delay_prob=0.5)
+    Simulator(seed=1, config=config, observer=spy).run_until(1000)
+    delays = [i for i, (kind, _) in enumerate(spy.events) if kind == "delay"]
+    assert delays and spy.count("duplicate")
+    for i in delays:
+        (_, delay), (kind, send) = spy.events[i], spy.events[i + 1]
+        assert kind == "send"
+        assert (send["src"], send["dst"], send["msg"]) == (delay["src"], delay["dst"], delay["msg"])
 
 
 def test_events_agree_with_the_trace(monkeypatch):
